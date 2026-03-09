@@ -683,9 +683,9 @@ async function getShoppeGoods(tenant) {
         ? `/plugin/shoppe/${tenant.uuid}/post/${encodeURIComponent(title)}`
         : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`
     };
-    const bucket = goods[product.category];
+    const CATEGORY_BUCKET = { book: 'books', music: 'music', post: 'posts', 'post-series': 'posts', album: 'albums', product: 'products' };
+    const bucket = goods[CATEGORY_BUCKET[product.category]];
     if (bucket) bucket.push(item);
-    else goods.products.push(item);
   }
 
   return goods;
