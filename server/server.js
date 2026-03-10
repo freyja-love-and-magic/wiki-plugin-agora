@@ -681,7 +681,11 @@ async function getShoppeGoods(tenant) {
       image: product.image ? `${getSanoraUrl()}/images/${product.image}` : null,
       url: isPost
         ? `/plugin/shoppe/${tenant.uuid}/post/${encodeURIComponent(title)}`
-        : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`
+        : (product.category === 'book' || (product.category === 'product' && !(product.shipping > 0)))
+          ? `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}/generic-recover-stripe`
+          : product.category === 'product'
+            ? `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}/generic-address-stripe`
+            : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`
     };
     const CATEGORY_BUCKET = { book: 'books', music: 'music', post: 'posts', 'post-series': 'posts', album: 'albums', product: 'products' };
     const bucket = goods[CATEGORY_BUCKET[product.category]];
@@ -702,7 +706,7 @@ function renderCards(items, category) {
       ? `<div class="card-img"><img src="${item.image}" alt="" loading="lazy"></div>`
       : `<div class="card-img-placeholder">${CATEGORY_EMOJI[category] || '🎁'}</div>`;
     const priceHtml = (item.price > 0 || category === 'product')
-      ? `<div class="price">$${item.price}${item.shipping ? ` <span class="shipping">+ $${item.shipping} shipping</span>` : ''}</div>`
+      ? `<div class="price">$${(item.price / 100).toFixed(2)}${item.shipping ? ` <span class="shipping">+ $${(item.shipping / 100).toFixed(2)} shipping</span>` : ''}</div>`
       : '';
     return `
       <div class="card" onclick="window.open('${item.url}','_blank')">
