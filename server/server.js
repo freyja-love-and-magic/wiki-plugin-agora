@@ -9,6 +9,20 @@ const sessionless = require('sessionless-node');
 
 const SHOPPE_BASE_EMOJI = process.env.SHOPPE_BASE_EMOJI || '🛍️🎨🎁';
 
+const TEMPLATES_DIR = path.join(__dirname, 'templates');
+const RECOVER_STRIPE_TMPL  = fs.readFileSync(path.join(TEMPLATES_DIR, 'generic-recover-stripe.html'), 'utf8');
+const ADDRESS_STRIPE_TMPL  = fs.readFileSync(path.join(TEMPLATES_DIR, 'generic-address-stripe.html'), 'utf8');
+const EBOOK_DOWNLOAD_TMPL  = fs.readFileSync(path.join(TEMPLATES_DIR, 'ebook-download.html'), 'utf8');
+
+function getAllyabaseOrigin() {
+  try { return new URL(getSanoraUrl()).origin; } catch { return getSanoraUrl(); }
+}
+
+function fillTemplate(tmpl, vars) {
+  return Object.entries(vars).reduce((html, [k, v]) =>
+    html.replace(new RegExp(`\\{\\{${k}\\}\\}`, 'g'), v), tmpl);
+}
+
 const DATA_DIR     = path.join(process.env.HOME || '/root', '.shoppe');
 const TENANTS_FILE = path.join(DATA_DIR, 'tenants.json');
 const CONFIG_FILE  = path.join(DATA_DIR, 'config.json');
@@ -138,6 +152,25 @@ function generateEmojicode(tenants) {
   throw new Error('Failed to generate unique emojicode after 100 attempts');
 }
 
+async function addieCreateUser() {
+  const addieKeys = await sessionless.generateKeys(() => {}, () => null);
+  sessionless.getKeys = () => addieKeys;
+  const timestamp = Date.now().toString();
+  const message = timestamp + addieKeys.pubKey;
+  const signature = await sessionless.sign(message);
+
+  const resp = await fetch(`${getAllyabaseOrigin()}/plugin/allyabase/addie/user/create`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ timestamp, pubKey: addieKeys.pubKey, signature })
+  });
+
+  const addieUser = await resp.json();
+  if (addieUser.error) throw new Error(`Addie: ${addieUser.error}`);
+
+  return { uuid: addieUser.uuid, pubKey: addieKeys.pubKey, privateKey: addieKeys.privateKey };
+}
+
 async function registerTenant(name) {
   const tenants = loadTenants();
 
@@ -159,12 +192,21 @@ async function registerTenant(name) {
 
   const emojicode = generateEmojicode(tenants);
 
+  // Create a dedicated Addie user for payee splits
+  let addieKeys = null;
+  try {
+    addieKeys = await addieCreateUser();
+  } catch (err) {
+    console.warn('[shoppe] Could not create addie user (payouts unavailable):', err.message);
+  }
+
   const tenant = {
     uuid: sanoraUser.uuid,
     emojicode,
     name: name || 'Unnamed Shoppe',
     keys,
     sanoraUser,
+    addieKeys,
     createdAt: Date.now()
   };
 
@@ -681,11 +723,13 @@ async function getShoppeGoods(tenant) {
       image: product.image ? `${getSanoraUrl()}/images/${product.image}` : null,
       url: isPost
         ? `/plugin/shoppe/${tenant.uuid}/post/${encodeURIComponent(title)}`
-        : (product.category === 'book' || (product.category === 'product' && !(product.shipping > 0)))
-          ? `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}/generic-recover-stripe`
-          : product.category === 'product'
-            ? `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}/generic-address-stripe`
-            : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`
+        : product.category === 'book'
+          ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
+          : product.category === 'product' && product.shipping > 0
+            ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}/address`
+            : product.category === 'product'
+              ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
+              : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`
     };
     const CATEGORY_BUCKET = { book: 'books', music: 'music', post: 'posts', 'post-series': 'posts', album: 'albums', product: 'products' };
     const bucket = goods[CATEGORY_BUCKET[product.category]];
@@ -928,6 +972,103 @@ async function startServer(params) {
     saveConfig(config);
     console.log('[shoppe] Sanora URL set to:', sanoraUrl);
     res.json({ success: true });
+  });
+
+  // Purchase pages — shoppe-hosted versions of the Sanora payment templates
+  async function renderPurchasePage(req, res, templateHtml) {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+
+      const title = decodeURIComponent(req.params.title);
+      const sanoraUrlInternal = getSanoraUrl();
+      const wikiOrigin = `${req.protocol}://${req.get('host')}`;
+      const sanoraUrl = `${wikiOrigin}/plugin/allyabase/sanora`;
+      const productsResp = await fetch(`${sanoraUrlInternal}/products/${tenant.uuid}`);
+      const products = await productsResp.json();
+      const product = products[title] || Object.values(products).find(p => p.title === title);
+      if (!product) return res.status(404).send('<h1>Product not found</h1>');
+
+      const imageUrl = product.image ? `${sanoraUrlInternal}/images/${product.image}` : '';
+      const ebookUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}/download/${encodeURIComponent(title)}`;
+      const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
+      const payees = tenant.addieKeys
+        ? JSON.stringify([{ pubKey: tenant.addieKeys.pubKey, amount: product.price || 0 }])
+        : '[]';
+
+      const html = fillTemplate(templateHtml, {
+        title:           product.title || title,
+        description:     product.description || '',
+        image:           `"${imageUrl}"`,
+        amount:          String(product.price || 0),
+        formattedAmount: ((product.price || 0) / 100).toFixed(2),
+        productId:       product.productId || '',
+        pubKey:          '',
+        signature:       '',
+        sanoraUrl,
+        allyabaseOrigin: wikiOrigin,
+        ebookUrl,
+        shoppeUrl,
+        payees
+      });
+
+      res.set('Content-Type', 'text/html');
+      res.send(html);
+    } catch (err) {
+      console.error('[shoppe] purchase page error:', err);
+      res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
+    }
+  }
+
+  // Books + no-shipping products → recovery key + stripe
+  app.get('/plugin/shoppe/:identifier/buy/:title', (req, res) =>
+    renderPurchasePage(req, res, RECOVER_STRIPE_TMPL));
+
+  // Physical products with shipping → address + stripe
+  app.get('/plugin/shoppe/:identifier/buy/:title/address', (req, res) =>
+    renderPurchasePage(req, res, ADDRESS_STRIPE_TMPL));
+
+  // Ebook download page (reached after successful payment + hash creation)
+  app.get('/plugin/shoppe/:identifier/download/:title', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+
+      const title = decodeURIComponent(req.params.title);
+      const sanoraUrl = getSanoraUrl();
+      const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
+      const products = await productsResp.json();
+      const product = products[title] || Object.values(products).find(p => p.title === title);
+      if (!product) return res.status(404).send('<h1>Book not found</h1>');
+
+      const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
+
+      // Map artifact UUIDs to download paths by extension
+      let epubPath = '', pdfPath = '', mobiPath = '';
+      (product.artifacts || []).forEach(artifact => {
+        if (artifact.includes('epub')) epubPath = `${sanoraUrl}/artifacts/${artifact}`;
+        if (artifact.includes('pdf'))  pdfPath  = `${sanoraUrl}/artifacts/${artifact}`;
+        if (artifact.includes('mobi')) mobiPath = `${sanoraUrl}/artifacts/${artifact}`;
+      });
+
+      const html = fillTemplate(EBOOK_DOWNLOAD_TMPL, {
+        title:       product.title || title,
+        description: product.description || '',
+        image:       imageUrl,
+        productId:   product.productId || '',
+        pubKey:      '',
+        signature:   '',
+        epubPath,
+        pdfPath,
+        mobiPath
+      });
+
+      res.set('Content-Type', 'text/html');
+      res.send(html);
+    } catch (err) {
+      console.error('[shoppe] download page error:', err);
+      res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
+    }
   });
 
   // Post reader — fetches markdown from Sanora and renders it as HTML
