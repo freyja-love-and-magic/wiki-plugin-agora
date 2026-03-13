@@ -83,7 +83,7 @@
         </div>
         
         <!-- Payment Form -->
-        <div>
+        <div id="payment-section" style="display:none">
           <h3 style="margin-bottom: 20px; color: #10b981;">Payment Details</h3>
           <form id="payment-form" class="payment-form" style="
             background: #2a2a2e; 
@@ -137,29 +137,18 @@
 </style>
 
 <script type="text/javascript">
-  // Buy button functionality
+  // Buy button — just reveal the forms section (payment init happens after recovery key submitted)
   document.getElementById('buy-button').addEventListener('click', function() {
     const formsSection = document.getElementById('forms-section');
     formsSection.style.display = 'block';
-    
-    // Smooth scroll to forms section
-    formsSection.scrollIntoView({ 
-      behavior: 'smooth',
-      block: 'start'
-    });
-    
-    // Initialize payment form
-    window.addPaymentForm();
+    formsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
-  
-  // Form validation for both forms
+
+  // Enable submit once Stripe payment element is ready
   function validateAllForms() {
-    const recoveryValid = validateForm(formConfig);
-    const paymentValid = stripe && elements; // Basic check that payment is initialized
-    
+    const paymentValid = stripe && elements;
     const submitButton = document.getElementById('submit-button');
-    
-    if (recoveryValid && paymentValid) {
+    if (paymentValid) {
       submitButton.style.background = 'linear-gradient(90deg, #10b981, #8b5cf6)';
       submitButton.style.color = 'white';
       submitButton.style.cursor = 'pointer';
@@ -170,7 +159,6 @@
       submitButton.style.color = '#999999';
       submitButton.style.cursor = 'not-allowed';
       submitButton.disabled = true;
-      submitButton.textContent = 'Complete Purchase';
     }
   }
 </script>
@@ -582,23 +570,43 @@
   };
 
   async function handleSubmit(formData) {
-      console.log('Form submitted:', formData);
-      // Do whatever you want with the form data
-      const recoveryHash = formData.Recovery + "{{productId}}";
-      const checkHashURL = `{{sanoraUrl}}/user/check-hash/${recoveryHash}/product/{{productId}}`
-
-      const resp = await fetch(checkHashURL);
-      const json = await resp.json();
-
-      if(json.success) {
-        window.location.href = '{{ebookUrl}}';
-        return;
-      }
-
       window.formData = formData;
-      // Don't show payment form here anymore, it's already visible
-      // Just trigger validation
-      validateAllForms();
+      const recoveryKey = formData.Recovery;
+
+      const submitBtn = document.querySelector('[type=submit]');
+      if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Checking…'; }
+
+      try {
+        const resp = await fetch('/plugin/shoppe/{{tenantUuid}}/purchase/intent', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recoveryKey, productId: '{{productId}}', title: '{{title}}' })
+        });
+        const json = await resp.json();
+
+        if (json.purchased) {
+          window.location.href = '{{ebookUrl}}';
+          return;
+        }
+
+        if (json.error) {
+          alert('Error: ' + json.error);
+          return;
+        }
+
+        // Show payment element
+        document.getElementById('payment-section').style.display = 'block';
+        stripe = Stripe(json.publishableKey);
+        elements = stripe.elements({ clientSecret: json.clientSecret });
+        const paymentElement = elements.create('payment');
+        paymentElement.mount('#payment-element');
+        paymentElement.on('ready', () => setTimeout(validateAllForms, 500));
+        paymentElement.on('change', () => setTimeout(validateAllForms, 100));
+      } catch (err) {
+        alert('Unexpected error: ' + err.message);
+      } finally {
+        if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Check'; }
+      }
   }
 
   const form = getForm(formConfig, handleSubmit);
@@ -608,130 +616,59 @@
 <script type="text/javascript">
   let stripe;
   let elements;
-  let response;
 
   const paymentForm = document.getElementById('payment-form');
   const submitButton = document.getElementById('submit-button');
   const errorMessage = document.getElementById('error-message');
   const loadingMessage = document.getElementById('loading');
 
-  async function getPaymentIntentWithoutSplits(amount, currency) {
-    try {
-      const payload = {
-	timestamp: new Date().getTime() + '',
-	amount: {{amount}}, 
-	currency: 'USD',
-	payees: {{payees}}
-      };
-
-      const res = await fetch(`{{allyabaseOrigin}}/plugin/allyabase/addie/processor/stripe/intent`, {
-        method: 'put',
-        body: JSON.stringify(payload),
-        headers: {'Content-Type': 'application/json'}
-      });
-
-      const response = await res.json();
-console.log('got intent response', response);
-
-      stripe = Stripe(response.publishableKey);
-      elements = stripe.elements({
-        clientSecret: response.paymentIntent
-      });
-
-      const paymentElement = elements.create('payment');
-      paymentElement.mount('#payment-element');
-      
-      // Trigger validation when payment element is ready
-      paymentElement.on('ready', () => {
-        setTimeout(() => validateAllForms(), 500);
-      });
-      
-      paymentElement.on('change', () => {
-        setTimeout(() => validateAllForms(), 100);
-      });
-    } catch(err) {
-  console.warn(err);
-    }    
-  };
-
   window.confirmPayment = async () => {
-    const order = {
-      title: "{{title}}",
-      productId: "{{productId}}",
-      formData
-    };
-
     try {
       const { error } = await stripe.confirmPayment({
-          elements,
-          confirmParams: {
-              return_url: 'http://wiki.planetnineisaspaceship.com'
-          },
-          redirect: 'if_required'
+        elements,
+        confirmParams: { return_url: '{{shoppeUrl}}' },
+        redirect: 'if_required'
       });
 
-      if(error) {
-        return showError(error.message);
-      }
+      if (error) return showError(error.message);
 
-      await fetch('{{sanoraUrl}}/user/orders', {
-	method: 'PUT',
-	headers: {'Content-Type': 'application/json'},
-	body: JSON.stringify({timestamp: new Date().getTime() + '', order})
+      const order = { title: '{{title}}', productId: '{{productId}}', formData: window.formData };
+      const resp = await fetch('/plugin/shoppe/{{tenantUuid}}/purchase/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recoveryKey: window.formData.Recovery, productId: '{{productId}}', order })
       });
-      const recoveryHash = formData.Recovery + "{{productId}}";
-      const createHashURL = `{{sanoraUrl}}/user/create-hash/${recoveryHash}/product/{{productId}}`
-
-      const resp = await fetch(createHashURL);
       const json = await resp.json();
 
-      if(json.success) {
-	window.location.href = '{{ebookUrl}}';
-	return;
+      if (json.success) {
+        window.location.href = '{{ebookUrl}}';
+      } else {
+        window.alert('Payment successful, but error recording purchase. Contact greetings@planetnine.app');
       }
-
-      window.alert('Your payment was successful, but there was an error creating this recovery hash. Please contact greetings@planetnine.app for support.');
-
-    } catch(err) {
+    } catch (err) {
       showError('An unexpected error occurred.');
-console.warn('payment error: ', err);
+      console.warn('payment error:', err);
     }
   };
 
   paymentForm.addEventListener('submit', async (event) => {
     event.preventDefault();
-
-    if (!stripe || !elements) {
-      return;
-    }
-
-    // Disable payment form submission while processing
+    if (!stripe || !elements) return;
     setLoading(true);
-
     await window.confirmPayment();
-
     setLoading(false);
   });
 
   const showError = (message) => {
     errorMessage.textContent = message;
     errorMessage.style.display = 'block';
-    setTimeout(() => {
-      errorMessage.style.display = 'none';
-      errorMessage.textContent = '';
-    }, 5000);
+    setTimeout(() => { errorMessage.style.display = 'none'; errorMessage.textContent = ''; }, 5000);
   };
 
   const setLoading = (isLoading) => {
     submitButton.disabled = isLoading;
     loadingMessage.style.display = isLoading ? 'block' : 'none';
   };
-
-  const start = () => {
-    getPaymentIntentWithoutSplits({{amount}}, 'USD');
-  };
-
-  window.addPaymentForm = start;
 </script>
 </body>
 </html>

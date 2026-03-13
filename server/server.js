@@ -1,6 +1,7 @@
 (function() {
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const fetch = require('node-fetch');
 const multer = require('multer');
 const FormData = require('form-data');
@@ -10,13 +11,15 @@ const sessionless = require('sessionless-node');
 const SHOPPE_BASE_EMOJI = process.env.SHOPPE_BASE_EMOJI || '🛍️🎨🎁';
 
 const TEMPLATES_DIR = path.join(__dirname, 'templates');
-const RECOVER_STRIPE_TMPL  = fs.readFileSync(path.join(TEMPLATES_DIR, 'generic-recover-stripe.html'), 'utf8');
-const ADDRESS_STRIPE_TMPL  = fs.readFileSync(path.join(TEMPLATES_DIR, 'generic-address-stripe.html'), 'utf8');
-const EBOOK_DOWNLOAD_TMPL  = fs.readFileSync(path.join(TEMPLATES_DIR, 'ebook-download.html'), 'utf8');
+const RECOVER_STRIPE_TMPL      = fs.readFileSync(path.join(TEMPLATES_DIR, 'generic-recover-stripe.html'), 'utf8');
+const ADDRESS_STRIPE_TMPL      = fs.readFileSync(path.join(TEMPLATES_DIR, 'generic-address-stripe.html'), 'utf8');
+const EBOOK_DOWNLOAD_TMPL      = fs.readFileSync(path.join(TEMPLATES_DIR, 'ebook-download.html'), 'utf8');
+const APPOINTMENT_BOOKING_TMPL   = fs.readFileSync(path.join(TEMPLATES_DIR, 'appointment-booking.html'), 'utf8');
+const SUBSCRIPTION_SUBSCRIBE_TMPL = fs.readFileSync(path.join(TEMPLATES_DIR, 'subscription-subscribe.html'), 'utf8');
+const SUBSCRIPTION_MEMBERSHIP_TMPL = fs.readFileSync(path.join(TEMPLATES_DIR, 'subscription-membership.html'), 'utf8');
 
-function getAllyabaseOrigin() {
-  try { return new URL(getSanoraUrl()).origin; } catch { return getSanoraUrl(); }
-}
+const SUBSCRIPTION_PERIOD_MS = 30 * 24 * 60 * 60 * 1000; // default 30-day billing period
+
 
 function fillTemplate(tmpl, vars) {
   return Object.entries(vars).reduce((html, [k, v]) =>
@@ -25,7 +28,11 @@ function fillTemplate(tmpl, vars) {
 
 const DATA_DIR     = path.join(process.env.HOME || '/root', '.shoppe');
 const TENANTS_FILE = path.join(DATA_DIR, 'tenants.json');
+const BUYERS_FILE  = path.join(DATA_DIR, 'buyers.json');
 const CONFIG_FILE  = path.join(DATA_DIR, 'config.json');
+// Shipping addresses are stored locally only — never forwarded to Sanora or any third party.
+// This file contains PII (name, address). Purge individual records once orders ship.
+const ORDERS_FILE  = path.join(DATA_DIR, 'orders.json');
 const TMP_DIR      = '/tmp/shoppe-uploads';
 
 // ============================================================
@@ -45,6 +52,46 @@ function getSanoraUrl() {
   const config = loadConfig();
   if (config.sanoraUrl) return config.sanoraUrl.replace(/\/$/, '');
   return `http://localhost:${process.env.SANORA_PORT || 7243}`;
+}
+
+function getAddieUrl() {
+  try { return new URL(getSanoraUrl()).origin + '/plugin/allyabase/addie'; } catch { /* fall through */ }
+  return `http://localhost:${process.env.ADDIE_PORT || 3005}`;
+}
+
+function loadBuyers() {
+  if (!fs.existsSync(BUYERS_FILE)) return {};
+  try { return JSON.parse(fs.readFileSync(BUYERS_FILE, 'utf8')); } catch { return {}; }
+}
+
+function saveBuyers(buyers) {
+  fs.writeFileSync(BUYERS_FILE, JSON.stringify(buyers, null, 2));
+}
+
+async function getOrCreateBuyerAddieUser(recoveryKey, productId) {
+  const buyerKey = recoveryKey + productId;
+  const buyers = loadBuyers();
+  if (buyers[buyerKey]) return buyers[buyerKey];
+
+  const addieKeys = await sessionless.generateKeys(() => {}, () => null);
+  sessionless.getKeys = () => addieKeys;
+  const timestamp = Date.now().toString();
+  const message = timestamp + addieKeys.pubKey;
+  const signature = await sessionless.sign(message);
+
+  const resp = await fetch(`${getAddieUrl()}/user/create`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ timestamp, pubKey: addieKeys.pubKey, signature })
+  });
+
+  const addieUser = await resp.json();
+  if (addieUser.error) throw new Error(`Addie: ${addieUser.error}`);
+
+  const buyer = { uuid: addieUser.uuid, pubKey: addieKeys.pubKey, privateKey: addieKeys.privateKey };
+  buyers[buyerKey] = buyer;
+  saveBuyers(buyers);
+  return buyer;
 }
 
 // Same diverse palette as BDO emojicoding
@@ -159,7 +206,7 @@ async function addieCreateUser() {
   const message = timestamp + addieKeys.pubKey;
   const signature = await sessionless.sign(message);
 
-  const resp = await fetch(`${getAllyabaseOrigin()}/plugin/allyabase/addie/user/create`, {
+  const resp = await fetch(`${getAddieUrl()}/user/create`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ timestamp, pubKey: addieKeys.pubKey, signature })
@@ -380,7 +427,7 @@ async function processArchive(zipPath) {
       throw new Error('emojicode does not match registered tenant');
     }
 
-    const results = { books: [], music: [], posts: [], albums: [], products: [], warnings: [] };
+    const results = { books: [], music: [], posts: [], albums: [], products: [], appointments: [], subscriptions: [], warnings: [] };
 
     function readInfo(entryPath) {
       const infoPath = path.join(entryPath, 'info.json');
@@ -693,6 +740,107 @@ async function processArchive(zipPath) {
       }
     }
 
+    // ---- subscriptions/ ----
+    // Each subfolder defines one support tier (Patreon-style).
+    // info.json: { title, description, price (cents/month), benefits: [], renewalDays: 30 }
+    // cover.jpg / hero.jpg → product image.  All other files → exclusive member artifacts.
+    const subscriptionsDir = path.join(root, 'subscriptions');
+    if (fs.existsSync(subscriptionsDir)) {
+      const subFolders = fs.readdirSync(subscriptionsDir)
+        .filter(f => fs.statSync(path.join(subscriptionsDir, f)).isDirectory())
+        .sort();
+
+      for (const entry of subFolders) {
+        const entryPath = path.join(subscriptionsDir, entry);
+        const folderTitle = entry.replace(/^\d+-/, '');
+        try {
+          const info = readInfo(entryPath);
+          const title = info.title || folderTitle;
+          const description = info.description || '';
+          const price = info.price || 0;
+          const tierMeta = {
+            benefits:    info.benefits    || [],
+            renewalDays: info.renewalDays || 30
+          };
+
+          await sanoraCreateProduct(tenant, title, 'subscription', description, price, 0, 'subscription');
+
+          // Upload tier metadata (benefits list, renewal period) as a JSON artifact
+          const tierBuf = Buffer.from(JSON.stringify(tierMeta));
+          await sanoraUploadArtifact(tenant, title, tierBuf, 'tier-info.json', 'application/json');
+
+          // Cover image (optional)
+          const allFiles = fs.readdirSync(entryPath);
+          const coverFile = allFiles.find(f => /^(cover|hero)\.(jpg|jpeg|png|webp)$/i.test(f));
+          if (coverFile) {
+            const buf = fs.readFileSync(path.join(entryPath, coverFile));
+            await sanoraUploadImage(tenant, title, buf, coverFile);
+          }
+
+          // Every other non-JSON, non-cover file is an exclusive member artifact
+          const exclusiveFiles = allFiles.filter(f =>
+            f !== 'info.json' && f !== coverFile && !f.endsWith('.json')
+          );
+          for (const ef of exclusiveFiles) {
+            const buf = fs.readFileSync(path.join(entryPath, ef));
+            await sanoraUploadArtifact(tenant, title, buf, ef, getMimeType(ef));
+          }
+
+          results.subscriptions.push({ title, price, renewalDays: tierMeta.renewalDays });
+          console.log(`[shoppe]   🎁 subscription tier: ${title} ($${price}/mo, ${exclusiveFiles.length} exclusive files)`);
+        } catch (err) {
+          console.warn(`[shoppe]   ⚠️  subscription ${entry}: ${err.message}`);
+        }
+      }
+    }
+
+    // ---- appointments/ ----
+    // Each subfolder is a bookable appointment type.
+    // info.json: { title, description, price, duration (mins), timezone, availability[], advanceDays }
+    // availability: [{ day: "monday", start: "09:00", end: "17:00" }, ...]
+    const appointmentsDir = path.join(root, 'appointments');
+    if (fs.existsSync(appointmentsDir)) {
+      const apptFolders = fs.readdirSync(appointmentsDir)
+        .filter(f => fs.statSync(path.join(appointmentsDir, f)).isDirectory())
+        .sort();
+
+      for (const entry of apptFolders) {
+        const entryPath = path.join(appointmentsDir, entry);
+        const folderTitle = entry.replace(/^\d+-/, '');
+        try {
+          const info = readInfo(entryPath);
+          const title = info.title || folderTitle;
+          const description = info.description || '';
+          const price = info.price || 0;
+          const schedule = {
+            duration:     info.duration     || 60,
+            timezone:     info.timezone     || 'America/New_York',
+            availability: info.availability || [],
+            advanceDays:  info.advanceDays  || 30
+          };
+
+          await sanoraCreateProduct(tenant, title, 'appointment', description, price, 0, 'appointment');
+
+          // Upload schedule as a JSON artifact so the booking page can retrieve it
+          const scheduleBuf = Buffer.from(JSON.stringify(schedule));
+          await sanoraUploadArtifact(tenant, title, scheduleBuf, 'schedule.json', 'application/json');
+
+          // Cover image (optional)
+          const images = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
+          const coverFile = images.find(f => /^(cover|hero)\.(jpg|jpeg|png|webp)$/i.test(f)) || images[0];
+          if (coverFile) {
+            const coverBuf = fs.readFileSync(path.join(entryPath, coverFile));
+            await sanoraUploadImage(tenant, title, coverBuf, coverFile);
+          }
+
+          results.appointments.push({ title, price, duration: schedule.duration });
+          console.log(`[shoppe]   📅 appointment: ${title} ($${price}/session, ${schedule.duration}min)`);
+        } catch (err) {
+          console.warn(`[shoppe]   ⚠️  appointment ${entry}: ${err.message}`);
+        }
+      }
+    }
+
     return {
       tenant: { uuid: tenant.uuid, emojicode: tenant.emojicode, name: tenant.name },
       results
@@ -711,7 +859,7 @@ async function getShoppeGoods(tenant) {
   const resp = await fetch(`${getSanoraUrl()}/products/${tenant.uuid}`);
   const products = await resp.json();
 
-  const goods = { books: [], music: [], posts: [], albums: [], products: [] };
+  const goods = { books: [], music: [], posts: [], albums: [], products: [], appointments: [], subscriptions: [] };
 
   for (const [title, product] of Object.entries(products)) {
     const isPost = product.category === 'post' || product.category === 'post-series';
@@ -725,13 +873,17 @@ async function getShoppeGoods(tenant) {
         ? `/plugin/shoppe/${tenant.uuid}/post/${encodeURIComponent(title)}`
         : product.category === 'book'
           ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
-          : product.category === 'product' && product.shipping > 0
-            ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}/address`
-            : product.category === 'product'
-              ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
-              : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`
+          : product.category === 'subscription'
+            ? `/plugin/shoppe/${tenant.uuid}/subscribe/${encodeURIComponent(title)}`
+            : product.category === 'appointment'
+              ? `/plugin/shoppe/${tenant.uuid}/book/${encodeURIComponent(title)}`
+            : product.category === 'product' && product.shipping > 0
+              ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}/address`
+              : product.category === 'product'
+                ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
+                : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`
     };
-    const CATEGORY_BUCKET = { book: 'books', music: 'music', post: 'posts', 'post-series': 'posts', album: 'albums', product: 'products' };
+    const CATEGORY_BUCKET = { book: 'books', music: 'music', post: 'posts', 'post-series': 'posts', album: 'albums', product: 'products', appointment: 'appointments', subscription: 'subscriptions' };
     const bucket = goods[CATEGORY_BUCKET[product.category]];
     if (bucket) bucket.push(item);
   }
@@ -739,7 +891,125 @@ async function getShoppeGoods(tenant) {
   return goods;
 }
 
-const CATEGORY_EMOJI = { book: '📚', music: '🎵', post: '📝', album: '🖼️', product: '📦' };
+// ============================================================
+// APPOINTMENT UTILITIES
+// ============================================================
+
+// Fetch and parse the schedule JSON artifact for an appointment product.
+async function getAppointmentSchedule(tenant, product) {
+  const sanoraUrl = getSanoraUrl();
+  const scheduleArtifact = (product.artifacts || []).find(a => a.endsWith('.json'));
+  if (!scheduleArtifact) return null;
+  const resp = await fetch(`${sanoraUrl}/artifacts/${scheduleArtifact}`);
+  if (!resp.ok) return null;
+  try { return await resp.json(); } catch { return null; }
+}
+
+// Fetch booked slot strings for an appointment product from Sanora orders.
+async function getBookedSlots(tenant, productId) {
+  const sanoraUrl = getSanoraUrl();
+  const tenantKeys = tenant.keys;
+  sessionless.getKeys = () => tenantKeys;
+  const timestamp = Date.now().toString();
+  const signature = await sessionless.sign(timestamp + tenant.uuid);
+  const resp = await fetch(
+    `${sanoraUrl}/user/${tenant.uuid}/orders/${encodeURIComponent(productId)}?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`
+  );
+  if (!resp.ok) return [];
+  try {
+    const data = await resp.json();
+    return (data.orders || []).map(o => o.slot).filter(Boolean);
+  } catch { return []; }
+}
+
+// Generate available slot strings grouped by date.
+// Slot strings are "YYYY-MM-DDTHH:MM" in the appointment's local timezone.
+// Returns: [{ date: "YYYY-MM-DD", dayLabel: "Monday", slots: ["YYYY-MM-DDTHH:MM", ...] }]
+function generateAvailableSlots(schedule, bookedSlots) {
+  const DAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const timezone    = schedule.timezone    || 'UTC';
+  const advanceDays = schedule.advanceDays || 30;
+  const duration    = schedule.duration    || 60;
+  const bookedSet   = new Set(bookedSlots);
+
+  const dateFmt    = new Intl.DateTimeFormat('en-CA',  { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' });
+  const timeFmt    = new Intl.DateTimeFormat('en-GB',  { timeZone: timezone, hour: '2-digit', minute: '2-digit', hour12: false });
+  const weekdayFmt = new Intl.DateTimeFormat('en-US',  { timeZone: timezone, weekday: 'long' });
+  const dayLabelFmt= new Intl.DateTimeFormat('en-US',  { timeZone: timezone, weekday: 'long', month: 'short', day: 'numeric' });
+
+  const nowStr  = timeFmt.format(new Date());
+  const nowMins = parseInt(nowStr.split(':')[0]) * 60 + parseInt(nowStr.split(':')[1]);
+
+  const available = [];
+  const now = new Date();
+
+  for (let d = 0; d < advanceDays; d++) {
+    const date    = new Date(now.getTime() + d * 86400000);
+    const dateStr = dateFmt.format(date);
+    const dayName = weekdayFmt.format(date).toLowerCase();
+    const rule    = (schedule.availability || []).find(a => a.day.toLowerCase() === dayName);
+    if (!rule || !rule.slots || !rule.slots.length) continue;
+
+    const slots = [];
+    for (const slotTime of rule.slots) {
+      const [h, m] = slotTime.split(':').map(Number);
+      const slotMins = h * 60 + m;
+      // For today, skip slots within the next hour
+      if (d === 0 && slotMins <= nowMins + 60) continue;
+      const slotStr = `${dateStr}T${slotTime}`;
+      if (!bookedSet.has(slotStr)) slots.push(slotStr);
+    }
+
+    if (slots.length > 0) {
+      available.push({ date: dateStr, dayLabel: dayLabelFmt.format(date), slots });
+    }
+  }
+  return available;
+}
+
+// ============================================================
+// SUBSCRIPTION UTILITIES
+// ============================================================
+
+// Fetch tier metadata (benefits list, renewalDays) from the tier-info artifact.
+async function getTierInfo(tenant, product) {
+  const sanoraUrl = getSanoraUrl();
+  const tierArtifact = (product.artifacts || []).find(a => a.endsWith('.json'));
+  if (!tierArtifact) return null;
+  const resp = await fetch(`${sanoraUrl}/artifacts/${tierArtifact}`);
+  if (!resp.ok) return null;
+  try { return await resp.json(); } catch { return null; }
+}
+
+// Check whether a subscriber (identified by recoveryKey) has an active subscription
+// for a given subscription product.  Uses Sanora orders only — no session-based hash.
+// The recovery key itself is never stored; the order records sha256(recoveryKey+productId).
+async function getSubscriptionStatus(tenant, productId, recoveryKey) {
+  const orderKey  = crypto.createHash('sha256').update(recoveryKey + productId).digest('hex');
+  const sanoraUrl = getSanoraUrl();
+  const tenantKeys = tenant.keys;
+  sessionless.getKeys = () => tenantKeys;
+  const timestamp = Date.now().toString();
+  const signature = await sessionless.sign(timestamp + tenant.uuid);
+  try {
+    const resp = await fetch(
+      `${sanoraUrl}/user/${tenant.uuid}/orders/${encodeURIComponent(productId)}?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`
+    );
+    if (!resp.ok) return { active: false };
+    const data = await resp.json();
+    const myOrders = (data.orders || []).filter(o => o.orderKey === orderKey);
+    if (!myOrders.length) return { active: false };
+    const latest  = myOrders.reduce((a, b) => (b.paidAt > a.paidAt ? b : a));
+    const period  = (latest.renewalDays || 30) * 24 * 60 * 60 * 1000;
+    const renewsAt = latest.paidAt + period;
+    const now      = Date.now();
+    const active   = renewsAt > now;
+    const daysLeft = Math.max(0, Math.floor((renewsAt - now) / (24 * 60 * 60 * 1000)));
+    return { active, paidAt: latest.paidAt, renewsAt, daysLeft };
+  } catch { return { active: false }; }
+}
+
+const CATEGORY_EMOJI = { book: '📚', music: '🎵', post: '📝', album: '🖼️', product: '📦', appointment: '📅', subscription: '🎁' };
 
 function renderCards(items, category) {
   if (items.length === 0) {
@@ -767,18 +1037,20 @@ function renderCards(items, category) {
 function generateShoppeHTML(tenant, goods) {
   const total = Object.values(goods).flat().length;
   const tabs = [
-    { id: 'all', label: 'All', count: total, always: true },
-    { id: 'books',    label: '📚 Books',    count: goods.books.length },
-    { id: 'music',    label: '🎵 Music',    count: goods.music.length },
-    { id: 'posts',    label: '📝 Posts',    count: goods.posts.length },
-    { id: 'albums',   label: '🖼️ Albums',   count: goods.albums.length },
-    { id: 'products', label: '📦 Products', count: goods.products.length }
+    { id: 'all',          label: 'All',              count: total,                       always: true },
+    { id: 'books',        label: '📚 Books',          count: goods.books.length },
+    { id: 'music',        label: '🎵 Music',          count: goods.music.length },
+    { id: 'posts',        label: '📝 Posts',          count: goods.posts.length },
+    { id: 'albums',       label: '🖼️ Albums',         count: goods.albums.length },
+    { id: 'products',     label: '📦 Products',       count: goods.products.length },
+    { id: 'appointments',  label: '📅 Appointments',  count: goods.appointments.length },
+    { id: 'subscriptions', label: '🎁 Support',        count: goods.subscriptions.length }
   ]
     .filter(t => t.always || t.count > 0)
     .map((t, i) => `<div class="tab${i === 0 ? ' active' : ''}" onclick="show('${t.id}',this)">${t.label} <span class="badge">${t.count}</span></div>`)
     .join('');
 
-  const allItems = [...goods.books, ...goods.music, ...goods.posts, ...goods.albums, ...goods.products];
+  const allItems = [...goods.books, ...goods.music, ...goods.posts, ...goods.albums, ...goods.products, ...goods.appointments, ...goods.subscriptions];
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -828,6 +1100,11 @@ function generateShoppeHTML(tenant, goods) {
     <div id="posts" class="section"><div class="grid">${renderCards(goods.posts, 'post')}</div></div>
     <div id="albums" class="section"><div class="grid">${renderCards(goods.albums, 'album')}</div></div>
     <div id="products" class="section"><div class="grid">${renderCards(goods.products, 'product')}</div></div>
+    <div id="appointments" class="section"><div class="grid">${renderCards(goods.appointments, 'appointment')}</div></div>
+    <div id="subscriptions" class="section"><div class="grid">${renderCards(goods.subscriptions, 'subscription')}</div></div>
+    <div style="text-align:center;padding:24px 0 8px;font-size:14px;color:#888;">
+      Already a supporter? <a href="/plugin/shoppe/${tenant.uuid}/membership" style="color:#0066cc;">Access your membership →</a>
+    </div>
   </main>
   <script>
     function show(id, tab) {
@@ -965,10 +1242,11 @@ async function startServer(params) {
 
   // Save config (owner only)
   app.post('/plugin/shoppe/config', owner, (req, res) => {
-    const { sanoraUrl } = req.body;
+    const { sanoraUrl, addieUrl } = req.body;
     if (!sanoraUrl) return res.status(400).json({ success: false, error: 'sanoraUrl required' });
     const config = loadConfig();
     config.sanoraUrl = sanoraUrl;
+    if (addieUrl) config.addieUrl = addieUrl;
     saveConfig(config);
     console.log('[shoppe] Sanora URL set to:', sanoraUrl);
     res.json({ success: true });
@@ -1009,7 +1287,8 @@ async function startServer(params) {
         allyabaseOrigin: wikiOrigin,
         ebookUrl,
         shoppeUrl,
-        payees
+        payees,
+        tenantUuid:      tenant.uuid
       });
 
       res.set('Content-Type', 'text/html');
@@ -1027,6 +1306,364 @@ async function startServer(params) {
   // Physical products with shipping → address + stripe
   app.get('/plugin/shoppe/:identifier/buy/:title/address', (req, res) =>
     renderPurchasePage(req, res, ADDRESS_STRIPE_TMPL));
+
+  // Appointment booking page
+  app.get('/plugin/shoppe/:identifier/book/:title', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+
+      const title = decodeURIComponent(req.params.title);
+      const sanoraUrl = getSanoraUrl();
+      const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
+      const products = await productsResp.json();
+      const product = products[title] || Object.values(products).find(p => p.title === title);
+      if (!product) return res.status(404).send('<h1>Appointment not found</h1>');
+
+      const schedule = await getAppointmentSchedule(tenant, product);
+      const wikiOrigin = `${req.protocol}://${req.get('host')}`;
+      const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
+      const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
+
+      const price = product.price || 0;
+      const html = fillTemplate(APPOINTMENT_BOOKING_TMPL, {
+        title:           product.title || title,
+        description:     product.description || '',
+        image:           `"${imageUrl}"`,
+        amount:          String(price),
+        formattedAmount: (price / 100).toFixed(2),
+        productId:       product.productId || '',
+        timezone:        schedule ? schedule.timezone : 'UTC',
+        duration:        String(schedule ? schedule.duration : 60),
+        proceedLabel:    price === 0 ? 'Confirm Booking →' : 'Continue to Payment →',
+        shoppeUrl,
+        tenantUuid:      tenant.uuid
+      });
+
+      res.set('Content-Type', 'text/html');
+      res.send(html);
+    } catch (err) {
+      console.error('[shoppe] appointment booking page error:', err);
+      res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
+    }
+  });
+
+  // Available slots JSON for an appointment
+  app.get('/plugin/shoppe/:identifier/book/:title/slots', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+
+      const title = decodeURIComponent(req.params.title);
+      const sanoraUrl = getSanoraUrl();
+      const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
+      const products = await productsResp.json();
+      const product = products[title] || Object.values(products).find(p => p.title === title);
+      if (!product) return res.status(404).json({ error: 'Appointment not found' });
+
+      const schedule = await getAppointmentSchedule(tenant, product);
+      if (!schedule) return res.status(404).json({ error: 'Schedule not found' });
+
+      const bookedSlots = await getBookedSlots(tenant, product.productId);
+      const available = generateAvailableSlots(schedule, bookedSlots);
+
+      res.json({ available, timezone: schedule.timezone, duration: schedule.duration });
+    } catch (err) {
+      console.error('[shoppe] slots error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Subscription sign-up / renew page
+  app.get('/plugin/shoppe/:identifier/subscribe/:title', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+
+      const title = decodeURIComponent(req.params.title);
+      const sanoraUrl = getSanoraUrl();
+      const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
+      const products = await productsResp.json();
+      const product = products[title] || Object.values(products).find(p => p.title === title);
+      if (!product) return res.status(404).send('<h1>Tier not found</h1>');
+
+      const tierInfo = await getTierInfo(tenant, product);
+      const wikiOrigin = `${req.protocol}://${req.get('host')}`;
+      const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
+      const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
+      const benefits = tierInfo && tierInfo.benefits
+        ? tierInfo.benefits.map(b => `<li>${escHtml(b)}</li>`).join('')
+        : '';
+
+      const html = fillTemplate(SUBSCRIPTION_SUBSCRIBE_TMPL, {
+        title:           product.title || title,
+        description:     product.description || '',
+        image:           `"${imageUrl}"`,
+        amount:          String(product.price || 0),
+        formattedAmount: ((product.price || 0) / 100).toFixed(2),
+        productId:       product.productId || '',
+        benefits,
+        renewalDays:     String(tierInfo ? (tierInfo.renewalDays || 30) : 30),
+        shoppeUrl,
+        tenantUuid:      tenant.uuid
+      });
+
+      res.set('Content-Type', 'text/html');
+      res.send(html);
+    } catch (err) {
+      console.error('[shoppe] subscribe page error:', err);
+      res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
+    }
+  });
+
+  // Membership portal page
+  app.get('/plugin/shoppe/:identifier/membership', (req, res) => {
+    const tenant = getTenantByIdentifier(req.params.identifier);
+    if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+    const wikiOrigin = `${req.protocol}://${req.get('host')}`;
+    const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
+    const html = fillTemplate(SUBSCRIPTION_MEMBERSHIP_TMPL, { shoppeUrl, tenantUuid: tenant.uuid });
+    res.set('Content-Type', 'text/html');
+    res.send(html);
+  });
+
+  // Check subscription status for all tiers — used by the membership portal
+  app.post('/plugin/shoppe/:identifier/membership/check', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+
+      const { recoveryKey } = req.body;
+      if (!recoveryKey) return res.status(400).json({ error: 'recoveryKey required' });
+
+      const sanoraUrl = getSanoraUrl();
+      const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
+      const products = await productsResp.json();
+      const wikiOrigin = `${req.protocol}://${req.get('host')}`;
+      const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
+
+      const subscriptions = [];
+      for (const [title, product] of Object.entries(products)) {
+        if (product.category !== 'subscription') continue;
+
+        const [status, tierInfo] = await Promise.all([
+          getSubscriptionStatus(tenant, product.productId, recoveryKey),
+          getTierInfo(tenant, product)
+        ]);
+
+        // Only expose exclusive artifact URLs to active subscribers
+        const exclusiveArtifacts = status.active
+          ? (product.artifacts || [])
+              .filter(a => !a.endsWith('.json'))
+              .map(a => ({ name: a.split('-').slice(1).join('-'), url: `${sanoraUrl}/artifacts/${a}` }))
+          : [];
+
+        subscriptions.push({
+          title:              product.title || title,
+          productId:          product.productId,
+          description:        product.description || '',
+          price:              product.price || 0,
+          image:              product.image ? `${sanoraUrl}/images/${product.image}` : null,
+          benefits:           tierInfo ? (tierInfo.benefits || []) : [],
+          renewalDays:        tierInfo ? (tierInfo.renewalDays || 30) : 30,
+          active:             status.active,
+          daysLeft:           status.daysLeft  || 0,
+          renewsAt:           status.renewsAt  || null,
+          exclusiveArtifacts,
+          subscribeUrl:       `${shoppeUrl}/subscribe/${encodeURIComponent(product.title || title)}`
+        });
+      }
+
+      res.json({ subscriptions });
+    } catch (err) {
+      console.error('[shoppe] membership check error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Purchase intent — creates buyer Addie user, returns Stripe client secret.
+  // Digital products (recoveryKey): checks if already purchased first.
+  // Physical products (no recoveryKey): generates an orderRef the client carries to purchase/complete.
+  app.post('/plugin/shoppe/:identifier/purchase/intent', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+
+      const { recoveryKey, productId, title, slotDatetime } = req.body;
+      if (!productId) return res.status(400).json({ error: 'productId required' });
+      if (!recoveryKey && !title) return res.status(400).json({ error: 'recoveryKey or title required' });
+
+      const sanoraUrlInternal = getSanoraUrl();
+
+      // Get product price
+      const productsResp = await fetch(`${sanoraUrlInternal}/products/${tenant.uuid}`);
+      const products = await productsResp.json();
+      const product = (title && products[title]) || Object.values(products).find(p => p.productId === productId);
+      const amount = product?.price || 0;
+
+      let buyer;
+      let orderRef;
+
+      if (recoveryKey && product?.category === 'subscription') {
+        // Subscription flow — check if already actively subscribed
+        const status = await getSubscriptionStatus(tenant, productId, recoveryKey);
+        if (status.active) {
+          return res.json({ alreadySubscribed: true, renewsAt: status.renewsAt, daysLeft: status.daysLeft });
+        }
+        buyer = await getOrCreateBuyerAddieUser(recoveryKey, productId);
+      } else if (recoveryKey && slotDatetime) {
+        // Appointment flow — verify slot is still open before charging
+        const schedule = await getAppointmentSchedule(tenant, product);
+        if (schedule) {
+          const bookedSlots = await getBookedSlots(tenant, productId);
+          if (bookedSlots.includes(slotDatetime)) {
+            return res.status(409).json({ error: 'That time slot is no longer available.' });
+          }
+        }
+        buyer = await getOrCreateBuyerAddieUser(recoveryKey, productId);
+      } else if (recoveryKey) {
+        // Digital product flow — check if already purchased
+        const recoveryHash = recoveryKey + productId;
+        const checkResp = await fetch(`${sanoraUrlInternal}/user/check-hash/${encodeURIComponent(recoveryHash)}/product/${encodeURIComponent(productId)}`);
+        const checkJson = await checkResp.json();
+        if (checkJson.success) return res.json({ purchased: true });
+        buyer = await getOrCreateBuyerAddieUser(recoveryKey, productId);
+      } else {
+        // Physical product flow — generate an orderRef to link intent → complete
+        orderRef = crypto.randomBytes(16).toString('hex');
+        buyer = await getOrCreateBuyerAddieUser(orderRef, productId);
+      }
+
+      // Free items (price = 0) skip Stripe entirely
+      if (amount === 0) {
+        return res.json({ free: true });
+      }
+
+      // Sign and create Stripe intent via Addie
+      const payees = tenant.addieKeys ? [{ pubKey: tenant.addieKeys.pubKey, amount }] : [];
+      const buyerKeys = { pubKey: buyer.pubKey, privateKey: buyer.privateKey };
+      sessionless.getKeys = () => buyerKeys;
+      const intentTimestamp = Date.now().toString();
+      const intentSignature = await sessionless.sign(intentTimestamp + buyer.uuid + amount + 'USD');
+      const intentResp = await fetch(`${getAddieUrl()}/user/${buyer.uuid}/processor/stripe/intent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timestamp: intentTimestamp, amount, currency: 'USD', payees, signature: intentSignature })
+      });
+
+      const intentJson = await intentResp.json();
+      if (intentJson.error) return res.status(500).json({ error: intentJson.error });
+
+      const response = { purchased: false, clientSecret: intentJson.paymentIntent, publishableKey: intentJson.publishableKey };
+      if (orderRef) response.orderRef = orderRef;
+      res.json(response);
+    } catch (err) {
+      console.error('[shoppe] purchase intent error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Purchase complete — called after Stripe payment confirms.
+  // Digital: creates a recovery hash in Sanora.
+  // Physical: records the order (including shipping address) in Sanora, signed by the tenant.
+  //           Address is routed through the shoppe server so it never goes directly
+  //           from the browser to Sanora. It is only stored after payment succeeds.
+  app.post('/plugin/shoppe/:identifier/purchase/complete', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+
+      const { recoveryKey, productId, orderRef, address, title, amount, slotDatetime, contactInfo, type, renewalDays } = req.body;
+      const sanoraUrlInternal = getSanoraUrl();
+
+      if (recoveryKey && type === 'subscription') {
+        // Subscription payment — record an order with a hashed subscriber key + payment timestamp.
+        // The recovery key itself is never stored; orderKey = sha256(recoveryKey + productId).
+        const orderKey = crypto.createHash('sha256').update(recoveryKey + productId).digest('hex');
+        const tenantKeys = tenant.keys;
+        sessionless.getKeys = () => tenantKeys;
+        const ts  = Date.now().toString();
+        const sig = await sessionless.sign(ts + tenant.uuid);
+        const order = { orderKey, paidAt: Date.now(), title, productId, renewalDays: renewalDays || 30, status: 'active' };
+        await fetch(`${sanoraUrlInternal}/user/${tenant.uuid}/orders`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timestamp: ts, signature: sig, order })
+        });
+        return res.json({ success: true });
+      }
+
+      if (recoveryKey && slotDatetime) {
+        // Appointment — create recovery hash + record booking in Sanora
+        const recoveryHash = recoveryKey + productId;
+        const createResp = await fetch(`${sanoraUrlInternal}/user/create-hash/${encodeURIComponent(recoveryHash)}/product/${encodeURIComponent(productId)}`);
+        await createResp.json();
+
+        // Record the booking in Sanora (contact info flows through the server, never direct from browser)
+        const tenantKeys = tenant.keys;
+        sessionless.getKeys = () => tenantKeys;
+        const bookingTimestamp = Date.now().toString();
+        const bookingSignature = await sessionless.sign(bookingTimestamp + tenant.uuid);
+        const order = {
+          productId,
+          title,
+          slot: slotDatetime,
+          contactInfo: contactInfo || {},
+          status: 'booked'
+        };
+        await fetch(`${sanoraUrlInternal}/user/${tenant.uuid}/orders`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timestamp: bookingTimestamp, signature: bookingSignature, order })
+        });
+        return res.json({ success: true });
+      }
+
+      if (recoveryKey) {
+        // Digital product — create recovery hash so buyer can re-download
+        const recoveryHash = recoveryKey + productId;
+        const createResp = await fetch(`${sanoraUrlInternal}/user/create-hash/${encodeURIComponent(recoveryHash)}/product/${encodeURIComponent(productId)}`);
+        const createJson = await createResp.json();
+        return res.json({ success: createJson.success });
+      }
+
+      if (orderRef && address) {
+        // Physical product — record order in Sanora signed by the tenant.
+        // The shippingAddress is collected here (post-payment) and sent once, server-side.
+        const tenantKeys = tenant.keys;
+        sessionless.getKeys = () => tenantKeys;
+        const orderTimestamp = Date.now().toString();
+        const orderSignature = await sessionless.sign(orderTimestamp + tenant.uuid);
+        const order = {
+          productId,
+          title,
+          amount,
+          orderRef,
+          shippingAddress: {
+            recipientName: address.name,
+            street:        address.line1,
+            street2:       address.line2 || '',
+            city:          address.city,
+            state:         address.state,
+            zip:           address.zip,
+            country:       'US'
+          },
+          status: 'pending'
+        };
+        await fetch(`${sanoraUrlInternal}/user/${tenant.uuid}/orders`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timestamp: orderTimestamp, signature: orderSignature, order })
+        });
+        return res.json({ success: true });
+      }
+
+      res.status(400).json({ error: 'recoveryKey or (orderRef + address) required' });
+    } catch (err) {
+      console.error('[shoppe] purchase complete error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
 
   // Ebook download page (reached after successful payment + hash creation)
   app.get('/plugin/shoppe/:identifier/download/:title', async (req, res) => {

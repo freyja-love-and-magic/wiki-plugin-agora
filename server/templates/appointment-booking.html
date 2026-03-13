@@ -1,0 +1,458 @@
+<!doctype html>
+<html>
+<head>
+  <script src="https://js.stripe.com/v3/"></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <meta name="twitter:title" content="{{title}}">
+  <meta name="description" content="{{description}}">
+  <meta name="og:title" content="{{title}}">
+  <meta name="og:description" content="{{description}}">
+  <title>Book: {{title}}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f12; color: white; min-height: 100vh; }
+
+    .layout { display: flex; min-height: 100vh; }
+    .product-panel { flex: 0 0 380px; background: #18181c; border-right: 1px solid #333; padding: 40px 32px; display: flex; flex-direction: column; gap: 20px; }
+    .booking-panel { flex: 1; padding: 40px 40px; overflow-y: auto; }
+
+    .product-img { width: 100%; border-radius: 12px; object-fit: cover; max-height: 260px; display: block; }
+    .product-title { font-size: 22px; font-weight: 700; }
+    .product-desc { font-size: 14px; color: #aaa; line-height: 1.5; }
+    .product-meta { display: flex; gap: 16px; flex-wrap: wrap; }
+    .meta-chip { background: #2a2a2e; border-radius: 20px; padding: 6px 14px; font-size: 13px; color: #ccc; }
+    .meta-chip span { color: #7ec8e3; font-weight: 600; }
+
+    h2 { font-size: 18px; font-weight: 600; margin-bottom: 16px; color: #ddd; }
+
+    /* Date strip */
+    .date-strip { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 8px; margin-bottom: 24px; scrollbar-width: thin; }
+    .date-strip::-webkit-scrollbar { height: 4px; }
+    .date-strip::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
+    .date-card { flex: 0 0 72px; background: #2a2a2e; border: 2px solid #444; border-radius: 12px; padding: 10px 6px; text-align: center; cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+    .date-card:hover { border-color: #7ec8e3; }
+    .date-card.active { border-color: #7ec8e3; background: #1a3040; }
+    .date-card .dow { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+    .date-card .dom { font-size: 22px; font-weight: 700; margin: 2px 0; }
+    .date-card .mon { font-size: 11px; color: #aaa; }
+
+    /* Slot grid */
+    .slot-section { display: none; margin-bottom: 28px; }
+    .slot-section.visible { display: block; }
+    .slot-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+    .slot-btn { background: #2a2a2e; border: 2px solid #444; border-radius: 8px; padding: 8px 16px; font-size: 14px; color: #ddd; cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+    .slot-btn:hover { border-color: #7ec8e3; }
+    .slot-btn.active { border-color: #7ec8e3; background: #1a3040; color: white; }
+
+    /* Contact + recovery form */
+    .booking-form { display: none; background: #1e1e22; border: 1px solid #333; border-radius: 16px; padding: 28px; margin-bottom: 24px; }
+    .booking-form.visible { display: block; }
+    .selected-slot-display { background: #1a3040; border: 1px solid #7ec8e3; border-radius: 8px; padding: 10px 16px; font-size: 14px; color: #7ec8e3; margin-bottom: 20px; }
+    .field-group { margin-bottom: 16px; }
+    .field-group label { display: block; font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+    .field-group input { width: 100%; background: #2a2a2e; border: 1px solid #444; border-radius: 8px; padding: 10px 14px; color: white; font-size: 14px; outline: none; transition: border-color 0.15s; }
+    .field-group input:focus { border-color: #7ec8e3; }
+    .field-group .hint { font-size: 11px; color: #666; margin-top: 4px; }
+    .recovery-note { background: #2a2a1a; border: 1px solid #665; border-radius: 8px; padding: 12px 16px; font-size: 13px; color: #cc9; margin-bottom: 20px; line-height: 1.4; }
+
+    /* Payment section */
+    .payment-section { display: none; }
+    .payment-section.visible { display: block; }
+    #payment-element { margin-bottom: 16px; }
+
+    .btn-primary { width: 100%; padding: 14px; background: linear-gradient(90deg, #0066cc, #7ec8e3); color: white; border: none; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+    .btn-primary:hover { opacity: 0.9; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-outline { width: 100%; padding: 12px; background: transparent; color: #7ec8e3; border: 1px solid #7ec8e3; border-radius: 10px; font-size: 14px; cursor: pointer; margin-bottom: 12px; }
+    .btn-outline:hover { background: #1a3040; }
+
+    .error-msg { color: #ff6b6b; font-size: 13px; margin-top: 8px; display: none; }
+    .loading-msg { color: #aaa; font-size: 13px; margin-top: 8px; display: none; }
+    .no-slots { color: #888; font-size: 14px; padding: 20px 0; }
+
+    /* Confirmation */
+    .confirmation { display: none; text-align: center; padding: 40px 20px; }
+    .confirmation.visible { display: block; }
+    .confirmation .icon { font-size: 64px; margin-bottom: 16px; }
+    .confirmation h2 { font-size: 24px; margin-bottom: 8px; }
+    .confirmation p { color: #aaa; margin-bottom: 6px; }
+    .confirmation .slot-confirmed { font-size: 18px; color: #7ec8e3; font-weight: 600; margin: 16px 0; }
+
+    @media (max-width: 700px) {
+      .layout { flex-direction: column; }
+      .product-panel { flex: none; border-right: none; border-bottom: 1px solid #333; padding: 24px 20px; }
+      .booking-panel { padding: 24px 20px; }
+    }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <!-- Left: product info -->
+  <div class="product-panel">
+    <script>
+      (function() {
+        const src = {{image}};
+        if (src) {
+          document.write('<img class="product-img" src="' + src + '" alt="">');
+        }
+      })();
+    </script>
+    <div class="product-title">{{title}}</div>
+    <div class="product-desc">{{description}}</div>
+    <div class="product-meta">
+      <div class="meta-chip">💰 <span>${{formattedAmount}}</span> / session</div>
+      <div class="meta-chip">⏱ <span>{{duration}} min</span></div>
+      <div class="meta-chip">🕐 <span id="tz-display">{{timezone}}</span></div>
+    </div>
+  </div>
+
+  <!-- Right: booking flow -->
+  <div class="booking-panel">
+
+    <!-- Date selection -->
+    <div id="step-dates">
+      <h2>Choose a date</h2>
+      <div id="date-strip" class="date-strip"></div>
+      <div id="loading-slots" class="loading-msg" style="display:block;">Loading availability…</div>
+      <div id="no-availability" class="no-slots" style="display:none;">No upcoming availability found.</div>
+    </div>
+
+    <!-- Time slot selection -->
+    <div id="step-slots" class="slot-section">
+      <h2 id="slot-heading">Available times</h2>
+      <div id="slot-grid" class="slot-grid"></div>
+    </div>
+
+    <!-- Contact info + recovery key form -->
+    <div id="booking-form" class="booking-form">
+      <div id="selected-slot-display" class="selected-slot-display"></div>
+
+      <div class="recovery-note">
+        🔑 Choose a recovery key — a word or phrase only you know. You'll use it to look up your booking confirmation later.
+      </div>
+
+      <div class="field-group">
+        <label>Recovery Key *</label>
+        <input type="text" id="recovery-key" placeholder="e.g. sunflower-2026" autocomplete="off">
+      </div>
+      <div class="field-group">
+        <label>Your Name *</label>
+        <input type="text" id="contact-name" placeholder="Full name">
+      </div>
+      <div class="field-group">
+        <label>Email *</label>
+        <input type="email" id="contact-email" placeholder="For booking confirmation">
+        <div class="hint">Shared with the service provider only.</div>
+      </div>
+      <div class="field-group">
+        <label>Phone (optional)</label>
+        <input type="tel" id="contact-phone" placeholder="For appointment reminders">
+        <div class="hint">Optional. Shared with the service provider only.</div>
+      </div>
+      <button class="btn-outline" onclick="backToSlots()">← Change time</button>
+      <button class="btn-primary" id="proceed-to-pay" onclick="proceedToPay()">{{proceedLabel}}</button>
+      <div id="form-error" class="error-msg"></div>
+    </div>
+
+    <!-- Stripe payment -->
+    <div id="payment-section" class="payment-section">
+      <h2>Complete payment</h2>
+      <div id="selected-slot-payment" class="selected-slot-display" style="margin-bottom:16px;"></div>
+      <div id="payment-element"></div>
+      <button class="btn-primary" id="pay-btn" onclick="confirmPayment()">Pay ${{formattedAmount}}</button>
+      <div id="pay-error" class="error-msg"></div>
+      <div id="pay-loading" class="loading-msg"></div>
+    </div>
+
+    <!-- Confirmation -->
+    <div id="confirmation" class="confirmation">
+      <div class="icon">✅</div>
+      <h2>You're booked!</h2>
+      <div id="confirmation-slot" class="slot-confirmed"></div>
+      <p>{{title}}</p>
+      <p style="margin-top:16px;">A confirmation has been sent to the service provider.</p>
+      <p style="margin-top:8px; font-size:13px; color:#666;">Keep your recovery key safe — you can use it to look up this booking.</p>
+      <button class="btn-outline" style="margin-top:24px; max-width:200px;" onclick="window.location.href='{{shoppeUrl}}'">← Back to Shoppe</button>
+    </div>
+
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  const SHOPPE_URL   = '{{shoppeUrl}}';
+  const PRODUCT_ID   = '{{productId}}';
+  const TITLE        = '{{title}}';
+  const AMOUNT       = {{amount}};
+  const TIMEZONE     = '{{timezone}}';
+
+  let availableDates = [];   // [{ date, dayLabel, slots }]
+  let selectedDate   = null;
+  let selectedSlot   = null;
+  let stripe         = null;
+  let elements       = null;
+
+  // ── Slot loading ──────────────────────────────────────────────────────────
+
+  async function loadSlots() {
+    try {
+      const resp = await fetch(`${SHOPPE_URL}/book/${encodeURIComponent(TITLE)}/slots`);
+      const data = await resp.json();
+      document.getElementById('loading-slots').style.display = 'none';
+
+      if (!data.available || data.available.length === 0) {
+        document.getElementById('no-availability').style.display = 'block';
+        return;
+      }
+
+      availableDates = data.available;
+      renderDateStrip();
+      selectDate(availableDates[0]);
+    } catch (err) {
+      document.getElementById('loading-slots').textContent = 'Could not load availability.';
+    }
+  }
+
+  // ── Date strip ────────────────────────────────────────────────────────────
+
+  function renderDateStrip() {
+    const strip = document.getElementById('date-strip');
+    strip.innerHTML = '';
+    availableDates.forEach((d, i) => {
+      const parts = d.date.split('-');
+      const dateObj = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
+      const dow = dateObj.toLocaleDateString('en-US', { weekday: 'short' });
+      const mon = dateObj.toLocaleDateString('en-US', { month: 'short' });
+      const dom = dateObj.getDate();
+
+      const card = document.createElement('div');
+      card.className = 'date-card';
+      card.innerHTML = `<div class="dow">${dow}</div><div class="dom">${dom}</div><div class="mon">${mon}</div>`;
+      card.addEventListener('click', () => selectDate(d));
+      strip.appendChild(card);
+    });
+  }
+
+  function selectDate(dateData) {
+    selectedDate = dateData;
+    selectedSlot = null;
+
+    // Highlight active date card
+    document.querySelectorAll('.date-card').forEach((c, i) => {
+      c.classList.toggle('active', availableDates[i] === dateData);
+    });
+
+    // Show slot section
+    const slotSection = document.getElementById('step-slots');
+    slotSection.classList.add('visible');
+    document.getElementById('slot-heading').textContent = `Times on ${dateData.dayLabel}`;
+    renderSlotGrid(dateData.slots);
+
+    // Hide booking form and payment
+    document.getElementById('booking-form').classList.remove('visible');
+    document.getElementById('payment-section').classList.remove('visible');
+  }
+
+  // ── Slot grid ─────────────────────────────────────────────────────────────
+
+  function renderSlotGrid(slots) {
+    const grid = document.getElementById('slot-grid');
+    grid.innerHTML = '';
+    slots.forEach(slotStr => {
+      const [, time] = slotStr.split('T');
+      const [h, m] = time.split(':').map(Number);
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      const h12  = h % 12 || 12;
+      const label = `${h12}:${m.toString().padStart(2,'0')} ${ampm}`;
+
+      const btn = document.createElement('button');
+      btn.className = 'slot-btn';
+      btn.textContent = label;
+      btn.addEventListener('click', () => selectSlot(slotStr, label));
+      grid.appendChild(btn);
+    });
+  }
+
+  function selectSlot(slotStr, label) {
+    selectedSlot = slotStr;
+    document.querySelectorAll('.slot-btn').forEach(b => b.classList.remove('active'));
+    event.currentTarget.classList.add('active');
+
+    const display = formatSlotDisplay(slotStr);
+    document.getElementById('selected-slot-display').textContent = `📅 ${display}`;
+    document.getElementById('booking-form').classList.add('visible');
+    document.getElementById('booking-form').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function formatSlotDisplay(slotStr) {
+    const [datePart, timePart] = slotStr.split('T');
+    const [y, mo, d] = datePart.split('-').map(Number);
+    const [h, m] = timePart.split(':').map(Number);
+    const dateObj = new Date(y, mo - 1, d);
+    const dateLabel = dateObj.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    const h12  = h % 12 || 12;
+    const timeLabel = `${h12}:${m.toString().padStart(2,'0')} ${ampm} ${TIMEZONE}`;
+    return `${dateLabel} at ${timeLabel}`;
+  }
+
+  // ── Navigation ────────────────────────────────────────────────────────────
+
+  window.backToSlots = function() {
+    document.getElementById('booking-form').classList.remove('visible');
+    document.getElementById('payment-section').classList.remove('visible');
+    selectedSlot = null;
+    document.querySelectorAll('.slot-btn').forEach(b => b.classList.remove('active'));
+  };
+
+  // ── Proceed to payment ────────────────────────────────────────────────────
+
+  window.proceedToPay = async function() {
+    const recoveryKey  = document.getElementById('recovery-key').value.trim();
+    const name         = document.getElementById('contact-name').value.trim();
+    const email        = document.getElementById('contact-email').value.trim();
+    const errorEl      = document.getElementById('form-error');
+
+    if (!recoveryKey) { showFormError('Recovery key is required.'); return; }
+    if (!name)        { showFormError('Name is required.'); return; }
+    if (!email)       { showFormError('Email is required.'); return; }
+    if (!selectedSlot){ showFormError('Please select a time slot.'); return; }
+    errorEl.style.display = 'none';
+
+    document.getElementById('proceed-to-pay').disabled = true;
+
+    try {
+      const resp = await fetch(`${SHOPPE_URL}/purchase/intent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recoveryKey, productId: PRODUCT_ID, title: TITLE, slotDatetime: selectedSlot })
+      });
+      const data = await resp.json();
+
+      if (data.error) {
+        showFormError(data.error);
+        document.getElementById('proceed-to-pay').disabled = false;
+        return;
+      }
+
+      if (data.free) {
+        // Free booking — skip Stripe and record directly
+        const contactInfo = {
+          name:  document.getElementById('contact-name').value.trim(),
+          email: document.getElementById('contact-email').value.trim(),
+          phone: document.getElementById('contact-phone').value.trim()
+        };
+        await fetch(`${SHOPPE_URL}/purchase/complete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recoveryKey, productId: PRODUCT_ID, title: TITLE, slotDatetime: selectedSlot, contactInfo })
+        });
+        document.getElementById('booking-form').classList.remove('visible');
+        showConfirmation();
+        return;
+      }
+
+      // Show Stripe payment section
+      document.getElementById('booking-form').classList.remove('visible');
+      const paySection = document.getElementById('payment-section');
+      paySection.classList.add('visible');
+      document.getElementById('selected-slot-payment').textContent = `📅 ${formatSlotDisplay(selectedSlot)}`;
+
+      stripe   = Stripe(data.publishableKey);
+      elements = stripe.elements({ clientSecret: data.clientSecret });
+      elements.create('payment').mount('#payment-element');
+
+      paySection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (err) {
+      showFormError('Could not start checkout. Please try again.');
+      document.getElementById('proceed-to-pay').disabled = false;
+    }
+  };
+
+  // ── Confirm payment ───────────────────────────────────────────────────────
+
+  window.confirmPayment = async function() {
+    const payBtn     = document.getElementById('pay-btn');
+    const payError   = document.getElementById('pay-error');
+    const payLoading = document.getElementById('pay-loading');
+
+    payBtn.disabled = true;
+    payLoading.style.display = 'block';
+    payLoading.textContent   = 'Processing…';
+    payError.style.display   = 'none';
+
+    try {
+      const { error } = await stripe.confirmPayment({
+        elements,
+        confirmParams: { return_url: SHOPPE_URL },
+        redirect: 'if_required'
+      });
+
+      if (error) {
+        payError.textContent   = error.message;
+        payError.style.display = 'block';
+        payBtn.disabled        = false;
+        payLoading.style.display = 'none';
+        return;
+      }
+
+      // Payment succeeded — record booking server-side (contact info never goes direct to Sanora)
+      const recoveryKey  = document.getElementById('recovery-key').value.trim();
+      const contactInfo  = {
+        name:  document.getElementById('contact-name').value.trim(),
+        email: document.getElementById('contact-email').value.trim(),
+        phone: document.getElementById('contact-phone').value.trim()
+      };
+
+      await fetch(`${SHOPPE_URL}/purchase/complete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recoveryKey,
+          productId: PRODUCT_ID,
+          title: TITLE,
+          slotDatetime: selectedSlot,
+          contactInfo
+        })
+      });
+
+      showConfirmation();
+    } catch (err) {
+      payError.textContent   = 'An unexpected error occurred.';
+      payError.style.display = 'block';
+      payBtn.disabled        = false;
+      payLoading.style.display = 'none';
+      console.warn('payment error:', err);
+    }
+  };
+
+  // ── Confirmation screen ───────────────────────────────────────────────────
+
+  function showConfirmation() {
+    document.getElementById('payment-section').classList.remove('visible');
+    document.getElementById('step-dates').style.display    = 'none';
+    document.getElementById('step-slots').classList.remove('visible');
+
+    const conf = document.getElementById('confirmation');
+    conf.classList.add('visible');
+    document.getElementById('confirmation-slot').textContent = formatSlotDisplay(selectedSlot);
+    conf.scrollIntoView({ behavior: 'smooth' });
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  function showFormError(msg) {
+    const el = document.getElementById('form-error');
+    el.textContent   = msg;
+    el.style.display = 'block';
+  }
+
+  // Boot
+  loadSlots();
+})();
+</script>
+</body>
+</html>

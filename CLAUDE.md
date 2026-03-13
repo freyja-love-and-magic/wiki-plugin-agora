@@ -68,6 +68,16 @@ my-shoppe.zip
     01-T-Shirt/           ← numeric prefix sets display order
       hero.jpg            ← main product image (hero.jpg or hero.png)
       info.json
+  appointments/
+    Therapy Session/      ← subfolder per bookable service
+      cover.jpg           ← optional cover image
+      info.json           ← required (see format below)
+  subscriptions/
+    Bronze Tier/          ← subfolder per membership tier
+      cover.jpg           ← optional cover image
+      info.json           ← required (see format below)
+      bonus-track.mp3     ← any other files become exclusive member content
+      chapter-draft.pdf
 ```
 
 ### manifest.json
@@ -141,6 +151,43 @@ preview = "ocean.jpg"
 
 The hero image is resolved automatically: `hero.jpg` or `hero.png` is used if present, otherwise the first image in the folder. Folder numeric prefix (`01-`, `02-`, …) sets display order.
 
+### appointments/*/info.json
+
+```json
+{
+  "title": "60-Minute Therapy Session",
+  "description": "One-on-one counseling",
+  "price": 15000,
+  "duration": 60,
+  "timezone": "America/New_York",
+  "advanceDays": 30,
+  "availability": [
+    { "day": "Monday", "slots": ["09:00", "10:00", "11:00", "14:00", "15:00"] },
+    { "day": "Wednesday", "slots": ["09:00", "10:00", "14:00"] }
+  ]
+}
+```
+
+`price` is in cents. `duration` is minutes per slot. `timezone` is any IANA timezone string. `advanceDays` limits how far ahead slots are shown. `availability` lists days of the week with start times for each slot.
+
+### subscriptions/*/info.json
+
+```json
+{
+  "title": "Bronze Supporter",
+  "description": "Support the work and get exclusive content",
+  "price": 500,
+  "renewalDays": 30,
+  "benefits": [
+    "Early access to new releases",
+    "Monthly exclusive track",
+    "Name in credits"
+  ]
+}
+```
+
+`price` is in cents per period. `renewalDays` is the billing period length (default 30). `benefits` are bullet points shown on the subscribe page. All non-`info.json`, non-image files in the subfolder are uploaded as exclusive artifacts downloadable by active subscribers.
+
 ## Routes
 
 | Method | Path | Auth | Description |
@@ -151,6 +198,15 @@ The hero image is resolved automatically: `hero.jpg` or `hero.png` is used if pr
 | `GET`  | `/plugin/shoppe/:id` | Public | Shoppe HTML page |
 | `GET`  | `/plugin/shoppe/:id/goods` | Public | Goods JSON |
 | `GET`  | `/plugin/shoppe/:id/goods?category=books` | Public | Filtered goods JSON |
+| `GET`  | `/plugin/shoppe/:id/book/:title` | Public | Appointment booking page |
+| `GET`  | `/plugin/shoppe/:id/book/:title/slots` | Public | Available slots JSON |
+| `GET`  | `/plugin/shoppe/:id/subscribe/:title` | Public | Subscription sign-up page |
+| `GET`  | `/plugin/shoppe/:id/membership` | Public | Membership portal |
+| `POST` | `/plugin/shoppe/:id/membership/check` | Public | Check subscription status |
+| `POST` | `/plugin/shoppe/:id/purchase/intent` | Public | Create Stripe payment intent |
+| `POST` | `/plugin/shoppe/:id/purchase/complete` | Public | Record completed purchase |
+| `GET`  | `/plugin/shoppe/:id/download/:title` | Public | Ebook download page |
+| `GET`  | `/plugin/shoppe/:id/post/:title` | Public | Post reader |
 
 `:id` accepts either UUID or emojicode.
 

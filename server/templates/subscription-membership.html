@@ -1,0 +1,290 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Membership Portal</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f12; color: white; min-height: 100vh; }
+
+    header { background: linear-gradient(135deg, #1a1a2e, #0f3460); padding: 40px 32px; text-align: center; }
+    header h1 { font-size: 28px; font-weight: 700; margin-bottom: 6px; }
+    header p { color: #aaa; font-size: 14px; }
+
+    .container { max-width: 700px; margin: 0 auto; padding: 40px 24px; }
+
+    /* Key entry */
+    #key-section { background: #18181c; border: 1px solid #333; border-radius: 16px; padding: 32px; margin-bottom: 32px; }
+    #key-section h2 { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+    #key-section p { font-size: 14px; color: #888; margin-bottom: 20px; }
+    .input-row { display: flex; gap: 10px; }
+    .input-row input { flex: 1; background: #2a2a2e; border: 1px solid #444; border-radius: 8px; padding: 11px 14px; color: white; font-size: 14px; outline: none; transition: border-color 0.15s; }
+    .input-row input:focus { border-color: #7ec8e3; }
+    .btn-primary { padding: 11px 22px; background: linear-gradient(90deg, #0f3460, #7ec8e3); color: white; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+    .btn-primary:hover { opacity: 0.9; }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .error-msg { color: #ff6b6b; font-size: 13px; margin-top: 8px; display: none; }
+    .loading-msg { color: #aaa; font-size: 13px; margin-top: 8px; display: none; }
+
+    /* Subscription cards */
+    #results { display: none; }
+    #results h2 { font-size: 18px; font-weight: 600; margin-bottom: 16px; color: #ddd; }
+
+    .sub-card { background: #18181c; border: 1px solid #333; border-radius: 16px; overflow: hidden; margin-bottom: 20px; }
+    .sub-card.active { border-color: #3a6040; }
+    .sub-card-header { display: flex; gap: 16px; align-items: center; padding: 20px 24px; }
+    .sub-card-img { width: 64px; height: 64px; border-radius: 10px; object-fit: cover; flex-shrink: 0; background: #2a2a2e; }
+    .sub-card-title { font-size: 17px; font-weight: 700; margin-bottom: 4px; }
+    .sub-card-desc { font-size: 13px; color: #888; }
+    .status-badge { margin-left: auto; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; white-space: nowrap; flex-shrink: 0; }
+    .status-active   { background: #1a3a20; color: #5d9; }
+    .status-inactive { background: #2a2a2e; color: #888; }
+    .status-expired  { background: #3a1a1a; color: #f66; }
+
+    .sub-card-body { border-top: 1px solid #222; padding: 20px 24px; }
+
+    /* Active state */
+    .renewal-info { font-size: 13px; color: #aaa; margin-bottom: 16px; }
+    .renewal-info strong { color: #7ec8e3; }
+
+    .exclusive-section h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #888; margin-bottom: 12px; }
+    .artifact-list { display: flex; flex-direction: column; gap: 8px; }
+    .artifact-item { display: flex; align-items: center; gap: 12px; background: #222; border-radius: 8px; padding: 10px 14px; }
+    .artifact-icon { font-size: 20px; flex-shrink: 0; }
+    .artifact-name { font-size: 13px; color: #ddd; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .artifact-dl { padding: 5px 12px; background: #0f3460; color: #7ec8e3; border: 1px solid #7ec8e3; border-radius: 6px; font-size: 12px; text-decoration: none; white-space: nowrap; }
+    .artifact-dl:hover { background: #1a4070; }
+    .no-exclusive { font-size: 13px; color: #555; }
+
+    /* Benefits list */
+    .benefits-list { list-style: none; display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+    .benefits-list li { font-size: 13px; color: #aaa; padding-left: 18px; position: relative; }
+    .benefits-list li::before { content: '✓'; position: absolute; left: 0; color: #3a6; }
+
+    /* Inactive / expired CTA */
+    .cta-section { text-align: center; padding: 8px 0; }
+    .btn-subscribe { display: inline-block; padding: 12px 28px; background: linear-gradient(90deg, #0f3460, #7ec8e3); color: white; border: none; border-radius: 10px; font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer; }
+    .btn-subscribe:hover { opacity: 0.9; }
+
+    .back-link { text-align: center; margin-top: 28px; }
+    .back-link a { color: #666; font-size: 13px; text-decoration: none; }
+    .back-link a:hover { color: #aaa; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🎁 Membership Portal</h1>
+    <p>Enter your recovery key to access your membership benefits</p>
+  </header>
+
+  <div class="container">
+
+    <div id="key-section">
+      <h2>Check your membership</h2>
+      <p>Enter the recovery key you used when you subscribed.</p>
+      <div class="input-row">
+        <input type="text" id="recovery-key" placeholder="Your recovery key…" autocomplete="off" onkeydown="if(event.key==='Enter')checkMembership()">
+        <button class="btn-primary" id="check-btn" onclick="checkMembership()">Check →</button>
+      </div>
+      <div id="check-error" class="error-msg"></div>
+      <div id="check-loading" class="loading-msg"></div>
+    </div>
+
+    <div id="results">
+      <h2 id="results-heading"></h2>
+      <div id="cards-container"></div>
+    </div>
+
+    <div class="back-link">
+      <a href="{{shoppeUrl}}">← Back to shoppe</a>
+    </div>
+
+  </div>
+
+  <script>
+  (function() {
+    'use strict';
+
+    const SHOPPE_URL = '{{shoppeUrl}}';
+
+    function artifactIcon(name) {
+      const ext = (name.split('.').pop() || '').toLowerCase();
+      if (['mp3','flac','m4a','ogg','wav'].includes(ext)) return '🎵';
+      if (['pdf'].includes(ext)) return '📄';
+      if (['epub','mobi','azw'].includes(ext)) return '📚';
+      if (['jpg','jpeg','png','gif','webp'].includes(ext)) return '🖼️';
+      if (['zip','tar','gz'].includes(ext)) return '📦';
+      return '📎';
+    }
+
+    function formatDate(ts) {
+      return new Date(ts).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+    }
+
+    window.checkMembership = async function() {
+      const recoveryKey = document.getElementById('recovery-key').value.trim();
+      const errorEl     = document.getElementById('check-error');
+      const loadEl      = document.getElementById('check-loading');
+      if (!recoveryKey) { errorEl.textContent = 'Please enter your recovery key.'; errorEl.style.display = 'block'; return; }
+      errorEl.style.display = 'none';
+      loadEl.style.display  = 'block';
+      loadEl.textContent    = 'Checking…';
+      document.getElementById('check-btn').disabled = true;
+
+      try {
+        const resp = await fetch(`${SHOPPE_URL}/membership/check`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recoveryKey })
+        });
+        const data = await resp.json();
+        loadEl.style.display = 'none';
+        document.getElementById('check-btn').disabled = false;
+
+        if (data.error) { errorEl.textContent = data.error; errorEl.style.display = 'block'; return; }
+
+        renderResults(data.subscriptions || []);
+      } catch (err) {
+        loadEl.style.display = 'none';
+        document.getElementById('check-btn').disabled = false;
+        errorEl.textContent  = 'Could not check membership. Please try again.';
+        errorEl.style.display = 'block';
+      }
+    };
+
+    function renderResults(subscriptions) {
+      const container = document.getElementById('cards-container');
+      const heading   = document.getElementById('results-heading');
+      const results   = document.getElementById('results');
+
+      const activeCount = subscriptions.filter(s => s.active).length;
+      heading.textContent = activeCount > 0
+        ? `You have ${activeCount} active membership${activeCount !== 1 ? 's' : ''}`
+        : 'No active memberships found';
+
+      container.innerHTML = '';
+
+      if (subscriptions.length === 0) {
+        container.innerHTML = '<p style="color:#666;font-size:14px;">No subscription tiers found for this shoppe.</p>';
+      } else {
+        subscriptions.forEach(sub => renderCard(container, sub));
+      }
+
+      results.style.display = 'block';
+      results.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function renderCard(container, sub) {
+      const card = document.createElement('div');
+      card.className = `sub-card ${sub.active ? 'active' : ''}`;
+
+      const imgHtml = sub.image
+        ? `<img class="sub-card-img" src="${sub.image}" alt="">`
+        : `<div class="sub-card-img" style="display:flex;align-items:center;justify-content:center;font-size:28px;">🎁</div>`;
+
+      let statusLabel, statusClass;
+      if (sub.active) {
+        statusLabel = `✅ Active · ${sub.daysLeft}d left`;
+        statusClass = 'status-active';
+      } else if (sub.renewsAt) {
+        statusLabel = '⏰ Expired';
+        statusClass = 'status-expired';
+      } else {
+        statusLabel = 'Not subscribed';
+        statusClass = 'status-inactive';
+      }
+
+      card.innerHTML = `
+        <div class="sub-card-header">
+          ${imgHtml}
+          <div>
+            <div class="sub-card-title">${sub.title}</div>
+            <div class="sub-card-desc">${sub.description}</div>
+          </div>
+          <div class="status-badge ${statusClass}">${statusLabel}</div>
+        </div>
+        <div class="sub-card-body" id="body-${sub.productId}"></div>
+      `;
+      container.appendChild(card);
+
+      const body = card.querySelector(`#body-${sub.productId}`);
+
+      if (sub.active) {
+        // Renewal info
+        const renewDiv = document.createElement('div');
+        renewDiv.className = 'renewal-info';
+        renewDiv.innerHTML = `Renews on <strong>${formatDate(sub.renewsAt)}</strong>`;
+        body.appendChild(renewDiv);
+
+        // Benefits
+        if (sub.benefits && sub.benefits.length > 0) {
+          const ul = document.createElement('ul');
+          ul.className = 'benefits-list';
+          sub.benefits.forEach(b => {
+            const li = document.createElement('li');
+            li.textContent = b;
+            ul.appendChild(li);
+          });
+          body.appendChild(ul);
+        }
+
+        // Exclusive content
+        const excSection = document.createElement('div');
+        excSection.className = 'exclusive-section';
+
+        if (sub.exclusiveArtifacts && sub.exclusiveArtifacts.length > 0) {
+          excSection.innerHTML = '<h3>Your exclusive content</h3>';
+          const list = document.createElement('div');
+          list.className = 'artifact-list';
+          sub.exclusiveArtifacts.forEach(artifact => {
+            const item = document.createElement('div');
+            item.className = 'artifact-item';
+            item.innerHTML = `
+              <span class="artifact-icon">${artifactIcon(artifact.name)}</span>
+              <span class="artifact-name">${artifact.name}</span>
+              <a class="artifact-dl" href="${artifact.url}" download>Download</a>
+            `;
+            list.appendChild(item);
+          });
+          excSection.appendChild(list);
+        } else {
+          excSection.innerHTML = '<h3>Exclusive content</h3><p class="no-exclusive">No downloadable files for this tier — check back after the creator uploads an archive.</p>';
+        }
+        body.appendChild(excSection);
+
+        // Renew option
+        const renewBtn = document.createElement('div');
+        renewBtn.style.cssText = 'margin-top:16px;text-align:right;';
+        renewBtn.innerHTML = `<a class="artifact-dl" href="${sub.subscribeUrl}" style="padding:7px 16px;">Renew early →</a>`;
+        body.appendChild(renewBtn);
+
+      } else {
+        // Inactive — show benefits + subscribe CTA
+        if (sub.benefits && sub.benefits.length > 0) {
+          const ul = document.createElement('ul');
+          ul.className = 'benefits-list';
+          sub.benefits.forEach(b => {
+            const li = document.createElement('li');
+            li.textContent = b;
+            ul.appendChild(li);
+          });
+          body.appendChild(ul);
+        }
+
+        const cta = document.createElement('div');
+        cta.className = 'cta-section';
+        const price = (sub.price / 100).toFixed(2);
+        cta.innerHTML = `
+          <a class="btn-subscribe" href="${sub.subscribeUrl}">
+            ${sub.renewsAt ? 'Renew' : 'Subscribe'} — $${price}/month
+          </a>
+        `;
+        body.appendChild(cta);
+      }
+    }
+  })();
+  </script>
+</body>
+</html>

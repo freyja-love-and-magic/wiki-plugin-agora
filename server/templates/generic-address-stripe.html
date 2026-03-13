@@ -454,11 +454,16 @@
   };
 
   function handleSubmit(formData) {
-      console.log('Form submitted:', formData);
-      // Do whatever you want with the form data
-      window.formData = formData;
-      document.getElementById('payment-form').style.display = 'block';
-      window.addPaymentForm();
+      const address = {
+          name:  formData['Name'],
+          line1: formData['Address 1'],
+          line2: formData['Address 2'] || '',
+          city:  formData['City'],
+          state: formData['State'],
+          zip:   formData['Zip Code']
+      };
+      window.pendingAddress = address;
+      window.addPaymentForm(address);
   }
 
   const form = getForm(formConfig, handleSubmit);
@@ -468,83 +473,79 @@
 <script type="text/javascript">
   let stripe;
   let elements;
-  let response;
+  let orderRef;
 
   const paymentForm = document.getElementById('payment-form');
   const submitButton = document.getElementById('submit-button');
   const errorMessage = document.getElementById('error-message');
   const loadingMessage = document.getElementById('loading');
 
-  async function getPaymentIntentWithoutSplits(amount, currency) {
+  // Request a Stripe payment intent from the shoppe server.
+  // Address is held in memory here and only sent to the server after payment succeeds.
+  async function requestPaymentIntent(address) {
     try {
-      const payload = {
-	timestamp: new Date().getTime() + '',
-	amount: {{amount}}, 
-	currency: 'USD',
-	payees: {{payees}}
-      };
-
-      const res = await fetch(`{{allyabaseOrigin}}/plugin/allyabase/addie/processor/stripe/intent`, {
-        method: 'put',
-        body: JSON.stringify(payload),
-        headers: {'Content-Type': 'application/json'}
+      const res = await fetch('{{shoppeUrl}}/purchase/intent', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          productId: '{{productId}}',
+          title: '{{title}}'
+        })
       });
 
-      const response = await res.json();
-console.log('got intent response', response);
+      const data = await res.json();
+      if (data.error) { showError(data.error); return; }
 
-      stripe = Stripe(response.publishableKey);
-      elements = stripe.elements({
-        clientSecret: response.paymentIntent
-      });
+      orderRef = data.orderRef;
 
+      stripe = Stripe(data.publishableKey);
+      elements = stripe.elements({ clientSecret: data.clientSecret });
       const paymentElement = elements.create('payment');
       paymentElement.mount('#payment-element');
+      document.getElementById('payment-form').style.display = 'block';
     } catch(err) {
-  console.warn(err);
-    }    
-  };
+      showError('Could not start checkout. Please try again.');
+      console.warn(err);
+    }
+  }
 
+  // Called after Stripe confirms payment. Sends address to the shoppe server which
+  // records the order in Sanora — address never goes directly from browser to Sanora.
   window.confirmPayment = async () => {
-    const order = {
-      title: "{{title}}",
-      productId: "{{productId}}",
-      formData
-    };
-    await fetch('{{sanoraUrl}}/user/orders', {
-      method: 'PUT',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({timestamp: new Date().getTime() + '', order})
-    });
     try {
       const { error } = await stripe.confirmPayment({
-          elements,
-          confirmParams: {
-              return_url: '{{shoppeUrl}}',
-          },
+        elements,
+        confirmParams: { return_url: '{{shoppeUrl}}' },
+        redirect: 'if_required'
       });
 
-      if(error) {
-        showError(error.message);
-      }
+      if (error) { showError(error.message); return; }
+
+      // Payment succeeded — now record the order server-side with the shipping address
+      await fetch('{{shoppeUrl}}/purchase/complete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          orderRef,
+          productId: '{{productId}}',
+          title: '{{title}}',
+          amount: {{amount}},
+          address: window.pendingAddress
+        })
+      });
+
+      window.location.href = '{{shoppeUrl}}';
     } catch(err) {
       showError('An unexpected error occurred.');
-console.warn('payment error: ', err);
+      console.warn('payment error: ', err);
     }
   };
 
   paymentForm.addEventListener('submit', async (event) => {
     event.preventDefault();
-
-    if (!stripe || !elements) {
-      return;
-    }
-
-    // Disable payment form submission while processing
+    if (!stripe || !elements) return;
     setLoading(true);
-
     await window.confirmPayment();
-
     setLoading(false);
   });
 
@@ -562,11 +563,7 @@ console.warn('payment error: ', err);
     loadingMessage.style.display = isLoading ? 'block' : 'none';
   };
 
-  const start = () => {
-    getPaymentIntentWithoutSplits({{amount}}, 'USD');
-  };
-
-  window.addPaymentForm = start;
+  window.addPaymentForm = requestPaymentIntent;
 </script>
 </body>
 </html>

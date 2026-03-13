@@ -239,11 +239,13 @@
 
       const r = result.results;
       const counts = [
-        r.books.length    && `📚 ${r.books.length} book${r.books.length !== 1 ? 's' : ''}`,
-        r.music.length    && `🎵 ${r.music.length} music item${r.music.length !== 1 ? 's' : ''}`,
-        r.posts.length    && `📝 ${r.posts.length} post${r.posts.length !== 1 ? 's' : ''}`,
-        r.albums.length   && `🖼️ ${r.albums.length} album${r.albums.length !== 1 ? 's' : ''}`,
-        r.products.length && `📦 ${r.products.length} product${r.products.length !== 1 ? 's' : ''}`
+        r.books.length        && `📚 ${r.books.length} book${r.books.length !== 1 ? 's' : ''}`,
+        r.music.length        && `🎵 ${r.music.length} music item${r.music.length !== 1 ? 's' : ''}`,
+        r.posts.length        && `📝 ${r.posts.length} post${r.posts.length !== 1 ? 's' : ''}`,
+        r.albums.length       && `🖼️ ${r.albums.length} album${r.albums.length !== 1 ? 's' : ''}`,
+        r.products.length     && `📦 ${r.products.length} product${r.products.length !== 1 ? 's' : ''}`,
+        r.appointments && r.appointments.length && `📅 ${r.appointments.length} appointment${r.appointments.length !== 1 ? 's' : ''}`,
+        r.subscriptions && r.subscriptions.length && `🎁 ${r.subscriptions.length} subscription tier${r.subscriptions.length !== 1 ? 's' : ''}`
       ].filter(Boolean).join(' · ') || 'no items found';
 
       const warnings = (r.warnings && r.warnings.length > 0)

@@ -1,0 +1,258 @@
+<!doctype html>
+<html>
+<head>
+  <script src="https://js.stripe.com/v3/"></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <meta name="twitter:title" content="Support: {{title}}">
+  <meta name="description" content="{{description}}">
+  <meta name="og:title" content="Support: {{title}}">
+  <meta name="og:description" content="{{description}}">
+  <title>Support: {{title}}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f12; color: white; min-height: 100vh; }
+
+    .layout { display: flex; min-height: 100vh; }
+    .info-panel { flex: 0 0 400px; background: #18181c; border-right: 1px solid #333; padding: 48px 36px; display: flex; flex-direction: column; gap: 24px; }
+    .pay-panel { flex: 1; padding: 48px 48px; display: flex; flex-direction: column; justify-content: center; max-width: 520px; }
+
+    .tier-img { width: 100%; border-radius: 14px; object-fit: cover; max-height: 240px; display: block; }
+    .tier-name { font-size: 26px; font-weight: 700; }
+    .tier-desc { font-size: 14px; color: #aaa; line-height: 1.6; }
+
+    .price-block { background: linear-gradient(135deg, #1a1a2e, #0f3460); border-radius: 14px; padding: 20px 24px; text-align: center; }
+    .price-block .amount { font-size: 42px; font-weight: 800; color: #7ec8e3; }
+    .price-block .period { font-size: 14px; color: #aaa; margin-top: 4px; }
+    .price-block .note { font-size: 12px; color: #666; margin-top: 8px; }
+
+    .benefits-block h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #888; margin-bottom: 12px; }
+    .benefits-block ul { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+    .benefits-block li { font-size: 14px; color: #ccc; padding-left: 20px; position: relative; }
+    .benefits-block li::before { content: '✓'; position: absolute; left: 0; color: #7ec8e3; font-weight: 700; }
+
+    h2 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+    .subtitle { font-size: 14px; color: #888; margin-bottom: 28px; }
+
+    .recovery-note { background: #2a2a1a; border: 1px solid #665; border-radius: 10px; padding: 14px 16px; font-size: 13px; color: #cc9; margin-bottom: 20px; line-height: 1.5; }
+    .field-group { margin-bottom: 16px; }
+    .field-group label { display: block; font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+    .field-group input { width: 100%; background: #2a2a2e; border: 1px solid #444; border-radius: 8px; padding: 11px 14px; color: white; font-size: 14px; outline: none; transition: border-color 0.15s; }
+    .field-group input:focus { border-color: #7ec8e3; }
+
+    .btn-primary { width: 100%; padding: 15px; background: linear-gradient(90deg, #0f3460, #7ec8e3); color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 700; cursor: pointer; transition: opacity 0.15s; margin-top: 4px; }
+    .btn-primary:hover { opacity: 0.9; }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .error-msg  { color: #ff6b6b; font-size: 13px; margin-top: 10px; display: none; }
+    .loading-msg { color: #aaa; font-size: 13px; margin-top: 10px; display: none; }
+
+    #payment-section { display: none; }
+    #payment-element { margin-bottom: 16px; }
+
+    /* Confirmation */
+    #confirmation { display: none; text-align: center; }
+    #confirmation .icon { font-size: 60px; margin-bottom: 16px; }
+    #confirmation h2 { font-size: 24px; margin-bottom: 8px; }
+    #confirmation .renews { font-size: 15px; color: #7ec8e3; margin-top: 12px; }
+    #confirmation p { color: #aaa; font-size: 14px; margin-top: 8px; line-height: 1.5; }
+    .btn-outline { width: 100%; padding: 12px; background: transparent; color: #7ec8e3; border: 1px solid #7ec8e3; border-radius: 10px; font-size: 14px; cursor: pointer; margin-top: 20px; }
+    .btn-outline:hover { background: #1a3040; }
+
+    /* Already subscribed banner */
+    #already-subscribed { display: none; background: #1a3020; border: 1px solid #3a6; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+    #already-subscribed h3 { color: #5d9; font-size: 16px; margin-bottom: 6px; }
+    #already-subscribed p { color: #aaa; font-size: 14px; }
+
+    @media (max-width: 720px) {
+      .layout { flex-direction: column; }
+      .info-panel { flex: none; border-right: none; border-bottom: 1px solid #333; padding: 28px 20px; }
+      .pay-panel { padding: 28px 20px; }
+    }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <!-- Left: tier info -->
+  <div class="info-panel">
+    <script>
+      (function() { const s = {{image}}; if (s) document.write('<img class="tier-img" src="' + s + '" alt="">'); })();
+    </script>
+    <div class="tier-name">{{title}}</div>
+    <div class="tier-desc">{{description}}</div>
+
+    <div class="price-block">
+      <div class="amount">${{formattedAmount}}</div>
+      <div class="period">per month</div>
+      <div class="note">Renews every {{renewalDays}} days · manual renewal</div>
+    </div>
+
+    <div class="benefits-block" id="benefits-block" style="{{benefits_display}}">
+      <h3>What you get</h3>
+      <ul>{{benefits}}</ul>
+    </div>
+  </div>
+
+  <!-- Right: payment -->
+  <div class="pay-panel">
+
+    <div id="already-subscribed">
+      <h3>✅ You're already a supporter!</h3>
+      <p id="already-desc"></p>
+      <button class="btn-outline" onclick="window.location.href='{{shoppeUrl}}/membership'">View your membership →</button>
+    </div>
+
+    <div id="subscribe-form">
+      <h2>Become a supporter</h2>
+      <div class="subtitle">Use a recovery key to access your membership and exclusive content.</div>
+
+      <div class="recovery-note">
+        🔑 Choose a recovery key — a word or phrase only you know. You'll use it every time you want to access your membership benefits.
+      </div>
+
+      <div class="field-group">
+        <label>Recovery Key *</label>
+        <input type="text" id="recovery-key" placeholder="e.g. golden-ticket-2026" autocomplete="off">
+      </div>
+
+      <button class="btn-primary" id="subscribe-btn" onclick="startSubscription()">Continue to Payment →</button>
+      <div id="form-error" class="error-msg"></div>
+    </div>
+
+    <div id="payment-section">
+      <h2>Complete your support</h2>
+      <div class="subtitle">${{formattedAmount}}/month · renews every {{renewalDays}} days</div>
+      <div id="payment-element"></div>
+      <button class="btn-primary" id="pay-btn" onclick="confirmPayment()">Pay ${{formattedAmount}}</button>
+      <div id="pay-error" class="error-msg"></div>
+      <div id="pay-loading" class="loading-msg"></div>
+    </div>
+
+    <div id="confirmation">
+      <div class="icon">🎉</div>
+      <h2>Thank you for your support!</h2>
+      <div class="renews" id="renews-display"></div>
+      <p>Use your recovery key any time at the <a href="{{shoppeUrl}}/membership" style="color:#7ec8e3;">membership portal</a> to access exclusive content and check your subscription status.</p>
+      <p style="margin-top:12px;font-size:12px;color:#555;">Keep your recovery key safe — it's the only way to access your membership benefits.</p>
+      <button class="btn-outline" onclick="window.location.href='{{shoppeUrl}}/membership'">Access your membership →</button>
+    </div>
+
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  const SHOPPE_URL    = '{{shoppeUrl}}';
+  const PRODUCT_ID    = '{{productId}}';
+  const TITLE         = '{{title}}';
+  const AMOUNT        = {{amount}};
+  const RENEWAL_DAYS  = {{renewalDays}};
+
+  let stripe   = null;
+  let elements = null;
+
+  // Hide benefits block if empty
+  if (!document.querySelector('#benefits-block li')) {
+    document.getElementById('benefits-block').style.display = 'none';
+  }
+
+  window.startSubscription = async function() {
+    const recoveryKey = document.getElementById('recovery-key').value.trim();
+    const errorEl     = document.getElementById('form-error');
+    if (!recoveryKey) { showError(errorEl, 'Recovery key is required.'); return; }
+    errorEl.style.display = 'none';
+    document.getElementById('subscribe-btn').disabled = true;
+
+    try {
+      const resp = await fetch(`${SHOPPE_URL}/purchase/intent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recoveryKey, productId: PRODUCT_ID, title: TITLE })
+      });
+      const data = await resp.json();
+
+      if (data.alreadySubscribed) {
+        document.getElementById('subscribe-form').style.display = 'none';
+        const banner = document.getElementById('already-subscribed');
+        banner.style.display = 'block';
+        document.getElementById('already-desc').textContent =
+          `Your subscription is active for ${data.daysLeft} more day${data.daysLeft !== 1 ? 's' : ''}.`;
+        return;
+      }
+
+      if (data.error) { showError(errorEl, data.error); document.getElementById('subscribe-btn').disabled = false; return; }
+
+      document.getElementById('subscribe-form').style.display = 'none';
+      document.getElementById('payment-section').style.display = 'block';
+
+      stripe   = Stripe(data.publishableKey);
+      elements = stripe.elements({ clientSecret: data.clientSecret });
+      elements.create('payment').mount('#payment-element');
+    } catch (err) {
+      showError(errorEl, 'Could not start checkout. Please try again.');
+      document.getElementById('subscribe-btn').disabled = false;
+    }
+  };
+
+  window.confirmPayment = async function() {
+    const payBtn     = document.getElementById('pay-btn');
+    const payError   = document.getElementById('pay-error');
+    const payLoading = document.getElementById('pay-loading');
+    payBtn.disabled            = true;
+    payLoading.style.display   = 'block';
+    payLoading.textContent     = 'Processing…';
+    payError.style.display     = 'none';
+
+    try {
+      const { error } = await stripe.confirmPayment({
+        elements,
+        confirmParams: { return_url: SHOPPE_URL },
+        redirect: 'if_required'
+      });
+
+      if (error) {
+        showError(payError, error.message);
+        payBtn.disabled          = false;
+        payLoading.style.display = 'none';
+        return;
+      }
+
+      const recoveryKey = document.getElementById('recovery-key').value.trim();
+      const complete = await fetch(`${SHOPPE_URL}/purchase/complete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recoveryKey,
+          productId:   PRODUCT_ID,
+          title:       TITLE,
+          amount:      AMOUNT,
+          type:        'subscription',
+          renewalDays: RENEWAL_DAYS
+        })
+      });
+      await complete.json();
+
+      // Show confirmation
+      document.getElementById('payment-section').style.display = 'none';
+      const conf = document.getElementById('confirmation');
+      conf.style.display = 'block';
+      const renewsAt = new Date(Date.now() + RENEWAL_DAYS * 24 * 60 * 60 * 1000);
+      document.getElementById('renews-display').textContent =
+        `Active until ${renewsAt.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
+    } catch (err) {
+      showError(payError, 'An unexpected error occurred.');
+      payBtn.disabled          = false;
+      payLoading.style.display = 'none';
+    }
+  };
+
+  function showError(el, msg) {
+    el.textContent   = msg;
+    el.style.display = 'block';
+  }
+})();
+</script>
+</body>
+</html>
