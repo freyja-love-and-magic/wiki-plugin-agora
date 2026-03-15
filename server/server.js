@@ -1125,26 +1125,10 @@ async function processArchive(zipPath) {
             await sanoraUploadImage(tenant, title, coverBuf, coverFile);
           }
 
-          // Video file → Lucille (with content-hash deduplication)
-          const videoFiles = fs.readdirSync(entryPath).filter(f => VIDEO_EXTS.has(path.extname(f).toLowerCase()));
-          if (videoFiles.length > 0) {
-            const videoFilename = videoFiles[0];
-            const videoBuf = fs.readFileSync(path.join(entryPath, videoFilename));
-            const localHash = crypto.createHash('sha256').update(videoBuf).digest('hex');
-
-            const existing = existingLucilleVideos[title];
-            if (existing && existing.contentHash && existing.contentHash === localHash) {
-              console.log(`[shoppe]   ⏩ video unchanged, skipping upload: ${title}`);
-              results.videos.push({ title, price, skipped: true });
-            } else {
-              await lucilleRegisterVideo(tenant, title, description, tags, effectiveLucilleUrl);
-              await lucilleUploadVideo(tenant, title, videoBuf, videoFilename, effectiveLucilleUrl);
-              results.videos.push({ title, price });
-              console.log(`[shoppe]   🎬 video: ${title}`);
-            }
-          } else {
-            results.warnings.push(`video "${title}": no video file found (expected .mp4/.mov/.mkv/.webm/.avi)`);
-          }
+          // Register video metadata in Lucille (file upload happens separately via upload-info endpoint)
+          await lucilleRegisterVideo(tenant, title, description, tags, effectiveLucilleUrl);
+          results.videos.push({ title, price });
+          console.log(`[shoppe]   🎬 video registered: ${title} (upload file separately)`);
         } catch (err) {
           console.warn(`[shoppe]   ⚠️  video ${entry}: ${err.message}`);
           results.warnings.push(`video "${entry}": ${err.message}`);
@@ -1262,7 +1246,8 @@ async function getShoppeGoods(tenant) {
       shipping: product.shipping || 0,
       image: product.image ? `${getSanoraUrl()}/images/${product.image}` : null,
       url: (bucketName && redirects[bucketName]) || defaultUrl,
-      ...(lucillePlayerUrl && { lucillePlayerUrl })
+      ...(lucillePlayerUrl && { lucillePlayerUrl }),
+      ...(product.category === 'video' && { shoppeId: tenant.uuid })
     };
     const bucket = goods[bucketName];
     if (bucket) bucket.push(item);
@@ -1539,12 +1524,35 @@ function renderCards(items, category) {
   }
   return items.map(item => {
     const isVideo = !!item.lucillePlayerUrl;
+    const isUnuploadedVideo = item.shoppeId && !item.lucillePlayerUrl;
     const imgHtml = item.image
       ? `<div class="card-img${isVideo ? ' card-video-play' : ''}"><img src="${item.image}" alt="" loading="lazy"></div>`
-      : `<div class="card-img-placeholder">${CATEGORY_EMOJI[category] || '🎁'}</div>`;
+      : isUnuploadedVideo
+        ? `<div class="card-img-placeholder card-video-upload"><span style="font-size:44px">🎬</span></div>`
+        : `<div class="card-img-placeholder">${CATEGORY_EMOJI[category] || '🎁'}</div>`;
     const priceHtml = (item.price > 0 || category === 'product')
       ? `<div class="price">$${(item.price / 100).toFixed(2)}${item.shipping ? ` <span class="shipping">+ $${(item.shipping / 100).toFixed(2)} shipping</span>` : ''}</div>`
       : '';
+    if (isUnuploadedVideo) {
+      const safeTitle = item.title.replace(/'/g, "\\'");
+      return `
+      <div class="card" id="video-card-${item.shoppeId}-${item.title.replace(/[^a-z0-9]/gi,'_')}">
+        ${imgHtml}
+        <div class="card-body">
+          <div class="card-title">${item.title}</div>
+          ${item.description ? `<div class="card-desc">${item.description}</div>` : ''}
+          ${priceHtml}
+          <div class="video-upload-area" id="upload-area-${item.shoppeId}-${item.title.replace(/[^a-z0-9]/gi,'_')}">
+            <label class="upload-btn-label">
+              📁 Upload Video
+              <input type="file" accept="video/*" style="display:none"
+                onchange="startVideoUpload(this,'${item.shoppeId}','${safeTitle}')">
+            </label>
+            <div class="upload-progress" style="display:none"></div>
+          </div>
+        </div>
+      </div>`;
+    }
     const clickHandler = isVideo
       ? `playVideo('${item.lucillePlayerUrl}')`
       : `window.open('${item.url}','_blank')`;
@@ -1622,6 +1630,12 @@ function generateShoppeHTML(tenant, goods) {
     .video-modal-content iframe { width: 100%; height: 100%; border: none; display: block; }
     .video-modal-close { position: absolute; top: 10px; right: 12px; z-index: 2; background: rgba(0,0,0,0.5); border: none; color: #fff; font-size: 20px; line-height: 1; padding: 4px 10px; border-radius: 6px; cursor: pointer; }
     .video-modal-close:hover { background: rgba(0,0,0,0.8); }
+    .card-video-upload { cursor: default !important; }
+    .upload-btn-label { display: inline-block; background: #0066cc; color: white; border-radius: 8px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; margin-top: 8px; }
+    .upload-btn-label:hover { background: #0052a3; }
+    .upload-progress { margin-top: 8px; font-size: 12px; color: #555; }
+    .upload-progress-bar { height: 4px; background: #e0e0e0; border-radius: 2px; margin-top: 4px; overflow: hidden; }
+    .upload-progress-bar-fill { height: 100%; background: #0066cc; border-radius: 2px; transition: width 0.2s; }
   </style>
 </head>
 <body>
@@ -1668,6 +1682,56 @@ function generateShoppeHTML(tenant, goods) {
       document.getElementById('video-iframe').src = '';
     }
     document.addEventListener('keydown', e => { if (e.key === 'Escape') closeVideo(); });
+
+    async function startVideoUpload(input, shoppeId, title) {
+      const file = input.files[0];
+      if (!file) return;
+
+      const areaId = 'upload-area-' + shoppeId + '-' + title.replace(/[^a-z0-9]/gi,'_');
+      const area = document.getElementById(areaId);
+      const progressDiv = area.querySelector('.upload-progress');
+      const label = area.querySelector('.upload-btn-label');
+
+      label.style.display = 'none';
+      progressDiv.style.display = 'block';
+      progressDiv.innerHTML = 'Getting upload credentials…';
+
+      try {
+        const infoRes = await fetch('/plugin/shoppe/' + shoppeId + '/video/' + encodeURIComponent(title) + '/upload-info');
+        if (!infoRes.ok) throw new Error('Could not get upload credentials (' + infoRes.status + ')');
+        const { uploadUrl, timestamp, signature } = await infoRes.json();
+
+        progressDiv.innerHTML = 'Uploading… 0%<div class="upload-progress-bar"><div class="upload-progress-bar-fill" id="fill-' + areaId + '" style="width:0%"></div></div>';
+
+        const form = new FormData();
+        form.append('video', file, file.name);
+
+        await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.upload.onprogress = e => {
+            if (e.lengthComputable) {
+              const pct = Math.round(e.loaded / e.total * 100);
+              progressDiv.querySelector('div').textContent = '';
+              progressDiv.firstChild.textContent = 'Uploading… ' + pct + '%';
+              const fill = document.getElementById('fill-' + areaId);
+              if (fill) fill.style.width = pct + '%';
+            }
+          };
+          xhr.onload = () => xhr.status === 200 ? resolve() : reject(new Error('Upload failed: ' + xhr.status));
+          xhr.onerror = () => reject(new Error('Network error during upload'));
+          xhr.open('PUT', uploadUrl);
+          xhr.setRequestHeader('x-pn-timestamp', timestamp);
+          xhr.setRequestHeader('x-pn-signature', signature);
+          xhr.send(form);
+        });
+
+        progressDiv.innerHTML = '✅ Uploaded! Reloading…';
+        setTimeout(() => location.reload(), 1500);
+      } catch (err) {
+        progressDiv.innerHTML = '❌ ' + err.message;
+        label.style.display = 'inline-block';
+      }
+    }
   </script>
 </body>
 </html>`;
@@ -2470,6 +2534,29 @@ async function startServer(params) {
     } catch (err) {
       console.error('[shoppe] post page error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
+    }
+  });
+
+  // GET /plugin/shoppe/:id/video/:title/upload-info (owner only)
+  // Returns a pre-signed lucille upload URL so the browser can PUT the video file directly to lucille.
+  app.get('/plugin/shoppe/:identifier/video/:title/upload-info', owner, async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'tenant not found' });
+      if (!tenant.lucilleKeys) return res.status(400).json({ error: 'tenant has no lucille user — re-register' });
+
+      const title = req.params.title;
+      const lucilleBase = getLucilleUrl().replace(/\/$/, '');
+      const { uuid: lucilleUuid, pubKey, privateKey } = tenant.lucilleKeys;
+
+      const timestamp = Date.now().toString();
+      sessionless.getKeys = () => ({ pubKey, privateKey });
+      const signature = await sessionless.sign(timestamp + pubKey);
+
+      const uploadUrl = `${lucilleBase}/user/${lucilleUuid}/video/${encodeURIComponent(title)}/file`;
+      res.json({ uploadUrl, timestamp, signature });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
   });
 

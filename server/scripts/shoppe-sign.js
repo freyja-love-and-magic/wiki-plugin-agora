@@ -185,7 +185,7 @@ function createZip() {
       execSync(`powershell -NoProfile -Command "${psCmd}"`, { stdio: 'pipe' });
     } else {
       execSync(
-        `zip -r "${outputZip}" . -x "*/shoppe-key.json"`,
+        `zip -r "${outputZip}" . -x "*/shoppe-key.json" -x "*.mp4" -x "*.mov" -x "*.mkv" -x "*.webm" -x "*.avi"`,
         { cwd: SHOPPE_DIR, stdio: 'pipe' }
       );
     }
