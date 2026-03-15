@@ -65,6 +65,12 @@ function getAddieUrl() {
   return `http://localhost:${process.env.ADDIE_PORT || 3005}`;
 }
 
+function getLucilleUrl() {
+  const config = loadConfig();
+  if (config.lucilleUrl) return config.lucilleUrl.replace(/\/$/, '');
+  return `http://localhost:${process.env.LUCILLE_PORT || 5444}`;
+}
+
 function loadBuyers() {
   if (!fs.existsSync(BUYERS_FILE)) return {};
   try { return JSON.parse(fs.readFileSync(BUYERS_FILE, 'utf8')); } catch { return {}; }
@@ -117,6 +123,7 @@ const EMOJI_PALETTE = [
 const BOOK_EXTS  = new Set(['.epub', '.pdf', '.mobi', '.azw', '.azw3']);
 const MUSIC_EXTS = new Set(['.mp3', '.flac', '.m4a', '.ogg', '.wav']);
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg']);
+const VIDEO_EXTS = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi']);
 
 // ============================================================
 // MARKDOWN / FRONT MATTER UTILITIES
@@ -155,6 +162,131 @@ function buildTags(baseTags, keywords) {
     .map(kw => `kw:${kw.trim()}`).filter(Boolean);
   if (!kwTags.length) return baseTags;
   return baseTags + ',' + kwTags.join(',');
+}
+
+// ── Owner key pair (secp256k1 via sessionless) ───────────────────────────────
+
+async function generateOwnerKeyPair() {
+  const keys = await sessionless.generateKeys(() => {}, () => null);
+  return { pubKey: keys.pubKey, privateKey: keys.privateKey };
+}
+
+// Validate owner signature embedded in a manifest.
+// If the tenant has no ownerPubKey (registered before this feature), validation is skipped.
+function validateOwnerSignature(manifest, tenant) {
+  if (!tenant.ownerPubKey) return; // legacy tenant — no signature required
+
+  if (!manifest.ownerPubKey || !manifest.timestamp || !manifest.signature) {
+    throw new Error(
+      'Archive is missing owner signature fields. Sign it first:\n' +
+      '  node shoppe-sign.js'
+    );
+  }
+  if (manifest.ownerPubKey !== tenant.ownerPubKey) {
+    throw new Error('Owner public key does not match the registered key for this shoppe');
+  }
+  const age = Date.now() - parseInt(manifest.timestamp, 10);
+  if (isNaN(age) || age < 0 || age > 10 * 60 * 1000) {
+    throw new Error('Signature timestamp is invalid or expired — re-run: node shoppe-sign.js');
+  }
+  const message = manifest.timestamp + manifest.uuid;
+  if (!sessionless.verifySignature(manifest.signature, message, manifest.ownerPubKey)) {
+    throw new Error('Owner signature verification failed');
+  }
+}
+
+// Single-use bundle tokens: token → { uuid, expiresAt }
+const bundleTokens = new Map();
+
+// Build the starter bundle zip for a newly registered tenant.
+function generateBundleBuffer(tenant, ownerPrivateKey, ownerPubKey, wikiOrigin) {
+  const SIGN_SCRIPT = fs.readFileSync(
+    path.join(__dirname, 'scripts', 'shoppe-sign.js')
+  );
+
+  const manifest = {
+    uuid:     tenant.uuid,
+    emojicode: tenant.emojicode,
+    name:     tenant.name,
+    wikiUrl:  `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`
+  };
+
+  const keyData = { privateKey: ownerPrivateKey, pubKey: ownerPubKey };
+
+  const packageJson = JSON.stringify({
+    name: 'shoppe',
+    version: '1.0.0',
+    private: true,
+    description: 'Shoppe content folder',
+    dependencies: {
+      'sessionless-node': '^0.9.12'
+    }
+  }, null, 2);
+
+  const readme = [
+    `# ${tenant.name} — Shoppe Starter`,
+    '',
+    '## First-time setup',
+    '',
+    '1. Install Node.js if needed: https://nodejs.org',
+    '2. Run: `npm install`  (installs sessionless-node — one time only)',
+    '3. Run: `node shoppe-sign.js init`',
+    '   This moves your private key to ~/.shoppe/keys/ and removes it from this folder.',
+    '',
+    '## Adding content',
+    '',
+    'Add your goods to the appropriate folders:',
+    '',
+    '  books/          → .epub / .pdf / .mobi  (+ cover.jpg + info.json)',
+    '  music/          → album subfolders or standalone .mp3 files',
+    '  posts/          → numbered subfolders with post.md',
+    '  albums/         → photo album subfolders',
+    '  products/       → physical products with info.json',
+    '  videos/         → numbered subfolders with .mp4/.mov/.mkv + cover.jpg + info.json',
+    '  appointments/   → bookable services with info.json',
+    '  subscriptions/  → membership tiers with info.json',
+    '',
+    'Each content folder can have an optional info.json:',
+    '  { "title": "…", "description": "…", "price": 0, "keywords": ["tag1","tag2"] }',
+    '',
+    '## Uploading',
+    '',
+    'Run: `node shoppe-sign.js`',
+    '',
+    'This signs your manifest and creates a ready-to-upload zip next to this folder.',
+    'Drag that zip onto your wiki\'s shoppe plugin.',
+    '',
+    '## Re-uploading',
+    '',
+    'Add or update content, then run `node shoppe-sign.js` again.',
+    'Each upload overwrites existing items and adds new ones.',
+    '',
+    '## Viewing orders',
+    '',
+    'Run: `node shoppe-sign.js orders`',
+    '',
+    'Opens a signed link to your order dashboard (valid for 5 minutes).',
+    '',
+    '## Setting up payouts (Stripe)',
+    '',
+    'Run: `node shoppe-sign.js payouts`',
+    '',
+    'Opens Stripe Connect onboarding so you can receive payments.',
+    'Do this once before your first sale.',
+  ].join('\n');
+
+  const zip = new AdmZip();
+  zip.addFile('manifest.json',  Buffer.from(JSON.stringify(manifest, null, 2)));
+  zip.addFile('shoppe-key.json', Buffer.from(JSON.stringify(keyData, null, 2)));
+  zip.addFile('shoppe-sign.js', SIGN_SCRIPT);
+  zip.addFile('package.json',   Buffer.from(packageJson));
+  zip.addFile('README.md',      Buffer.from(readme));
+
+  for (const dir of ['books', 'music', 'posts', 'albums', 'products', 'appointments', 'subscriptions']) {
+    zip.addFile(`${dir}/.gitkeep`, Buffer.from(''));
+  }
+
+  return zip.toBuffer();
 }
 
 function renderMarkdown(md) {
@@ -269,6 +401,16 @@ async function registerTenant(name) {
     console.warn('[shoppe] Could not create addie user (payouts unavailable):', err.message);
   }
 
+  // Create a dedicated Lucille user for video uploads
+  let lucilleKeys = null;
+  try {
+    lucilleKeys = await lucilleCreateUser();
+  } catch (err) {
+    console.warn('[shoppe] Could not create lucille user (video uploads unavailable):', err.message);
+  }
+
+  const ownerKeys = await generateOwnerKeyPair();
+
   const tenant = {
     uuid: sanoraUser.uuid,
     emojicode,
@@ -276,6 +418,8 @@ async function registerTenant(name) {
     keys,
     sanoraUser,
     addieKeys,
+    lucilleKeys,
+    ownerPubKey: ownerKeys.pubKey,
     createdAt: Date.now()
   };
 
@@ -283,7 +427,15 @@ async function registerTenant(name) {
   saveTenants(tenants);
 
   console.log(`[shoppe] Registered tenant: "${name}" ${emojicode} (${sanoraUser.uuid})`);
-  return { uuid: sanoraUser.uuid, emojicode, name: tenant.name };
+  // ownerPrivateKey is returned once so the caller can include it in the starter bundle.
+  // It is NOT persisted server-side.
+  return {
+    uuid:            sanoraUser.uuid,
+    emojicode,
+    name:            tenant.name,
+    ownerPrivateKey: ownerKeys.privateKey,
+    ownerPubKey:     ownerKeys.pubKey
+  };
 }
 
 function getTenantByIdentifier(identifier) {
@@ -407,6 +559,91 @@ async function sanoraUploadImage(tenant, title, imageBuffer, filename) {
 }
 
 // ============================================================
+// LUCILLE HELPERS
+// ============================================================
+
+async function lucilleCreateUser(lucilleUrl) {
+  const url = lucilleUrl || getLucilleUrl();
+  const keys = await sessionless.generateKeys(() => {}, () => null);
+  sessionless.getKeys = () => keys;
+  const timestamp = Date.now().toString();
+  const message = timestamp + keys.pubKey;
+  const signature = await sessionless.sign(message);
+
+  const resp = await fetch(`${url}/user/create`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ timestamp, pubKey: keys.pubKey, signature })
+  });
+
+  const lucilleUser = await resp.json();
+  if (lucilleUser.error) throw new Error(`Lucille: ${lucilleUser.error}`);
+  return { uuid: lucilleUser.uuid, pubKey: keys.pubKey, privateKey: keys.privateKey };
+}
+
+async function lucilleGetVideos(lucilleUuid, lucilleUrl) {
+  const url = lucilleUrl || getLucilleUrl();
+  try {
+    const resp = await fetch(`${url}/videos/${lucilleUuid}`);
+    if (!resp.ok) return {};
+    return await resp.json();
+  } catch (err) {
+    return {};
+  }
+}
+
+async function lucilleRegisterVideo(tenant, title, description, tags, lucilleUrl) {
+  const url = lucilleUrl || getLucilleUrl();
+  const { lucilleKeys } = tenant;
+  if (!lucilleKeys) throw new Error('Tenant has no Lucille user — re-register to enable video uploads');
+  const timestamp = Date.now().toString();
+  sessionless.getKeys = () => lucilleKeys;
+  const signature = await sessionless.sign(timestamp + lucilleKeys.pubKey);
+
+  const resp = await fetch(
+    `${url}/user/${lucilleKeys.uuid}/video/${encodeURIComponent(title)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ timestamp, signature, description: description || '', tags: tags || [] })
+    }
+  );
+
+  const result = await resp.json();
+  if (result.error) throw new Error(`Lucille register video failed: ${result.error}`);
+  return result;
+}
+
+async function lucilleUploadVideo(tenant, title, fileBuffer, filename, lucilleUrl) {
+  const url = lucilleUrl || getLucilleUrl();
+  const { lucilleKeys } = tenant;
+  if (!lucilleKeys) throw new Error('Tenant has no Lucille user');
+  const timestamp = Date.now().toString();
+  sessionless.getKeys = () => lucilleKeys;
+  const signature = await sessionless.sign(timestamp + lucilleKeys.pubKey);
+
+  const form = new FormData();
+  form.append('video', fileBuffer, { filename, contentType: getMimeType(filename) });
+
+  const resp = await fetch(
+    `${url}/user/${lucilleKeys.uuid}/video/${encodeURIComponent(title)}/file`,
+    {
+      method: 'PUT',
+      headers: {
+        'x-pn-timestamp': timestamp,
+        'x-pn-signature': signature,
+        ...form.getHeaders()
+      },
+      body: form
+    }
+  );
+
+  const result = await resp.json();
+  if (result.error) throw new Error(`Lucille video upload failed: ${result.error}`);
+  return result;
+}
+
+// ============================================================
 // ARCHIVE PROCESSING
 // ============================================================
 
@@ -449,6 +686,9 @@ async function processArchive(zipPath) {
       throw new Error('emojicode does not match registered tenant');
     }
 
+    // Verify owner signature (required for tenants registered after signing support was added).
+    validateOwnerSignature(manifest, tenant);
+
     // Store manifest-level keywords and per-category redirect URLs in the tenant record.
     const tenantUpdates = {};
     if (Array.isArray(manifest.keywords) && manifest.keywords.length > 0) {
@@ -464,7 +704,7 @@ async function processArchive(zipPath) {
       Object.assign(tenant, tenantUpdates);
     }
 
-    const results = { books: [], music: [], posts: [], albums: [], products: [], appointments: [], subscriptions: [], warnings: [] };
+    const results = { books: [], music: [], posts: [], albums: [], products: [], videos: [], appointments: [], subscriptions: [], warnings: [] };
 
     function readInfo(entryPath) {
       const infoPath = path.join(entryPath, 'info.json');
@@ -831,6 +1071,78 @@ async function processArchive(zipPath) {
       }
     }
 
+    // ---- videos/ ----
+    // Each subfolder is a video. Contains the video file, optional cover/poster image, and info.json.
+    // info.json: { title, description, price, tags[] }
+    // Video is uploaded to Lucille (DO Spaces + WebTorrent seeder); Sanora holds the catalog entry.
+    //
+    // The manifest may specify a lucilleUrl to override the plugin's global config — this lets
+    // different shoppe tenants point to different Lucille instances.
+    //
+    // Deduplication: Lucille stores a SHA-256 contentHash for each uploaded file. Before uploading,
+    // shoppe computes the local file's hash and skips the upload if it matches what Lucille has.
+    const videosDir = path.join(root, 'videos');
+    if (fs.existsSync(videosDir)) {
+      const effectiveLucilleUrl = (manifest.lucilleUrl || '').replace(/\/$/, '') || null;
+
+      const videoFolders = fs.readdirSync(videosDir)
+        .filter(f => fs.statSync(path.join(videosDir, f)).isDirectory())
+        .sort();
+
+      // Fetch existing Lucille videos once for this tenant so we can dedup
+      let existingLucilleVideos = {};
+      if (tenant.lucilleKeys) {
+        existingLucilleVideos = await lucilleGetVideos(tenant.lucilleKeys.uuid, effectiveLucilleUrl);
+      }
+
+      for (const entry of videoFolders) {
+        const entryPath = path.join(videosDir, entry);
+        const folderTitle = entry.replace(/^\d+-/, '');
+        try {
+          const info = readInfo(entryPath);
+          const title = info.title || folderTitle;
+          const description = info.description || '';
+          const price = info.price || 0;
+          const tags = info.tags || [];
+
+          // Sanora catalog entry (for discovery / storefront)
+          await sanoraCreateProduct(tenant, title, 'video', description, price, 0, buildTags('video', info.keywords));
+
+          // Cover / poster image (optional)
+          const images = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
+          const coverFile = images.find(f => /^(cover|poster|hero|thumbnail)\.(jpg|jpeg|png|webp)$/i.test(f)) || images[0];
+          if (coverFile) {
+            const coverBuf = fs.readFileSync(path.join(entryPath, coverFile));
+            await sanoraUploadImage(tenant, title, coverBuf, coverFile);
+          }
+
+          // Video file → Lucille (with content-hash deduplication)
+          const videoFiles = fs.readdirSync(entryPath).filter(f => VIDEO_EXTS.has(path.extname(f).toLowerCase()));
+          if (videoFiles.length > 0) {
+            const videoFilename = videoFiles[0];
+            const videoBuf = fs.readFileSync(path.join(entryPath, videoFilename));
+            const localHash = crypto.createHash('sha256').update(videoBuf).digest('hex');
+
+            const existing = existingLucilleVideos[title];
+            if (existing && existing.contentHash && existing.contentHash === localHash) {
+              console.log(`[shoppe]   ⏩ video unchanged, skipping upload: ${title}`);
+              results.videos.push({ title, price, skipped: true });
+            } else {
+              await lucilleRegisterVideo(tenant, title, description, tags, effectiveLucilleUrl);
+              await lucilleUploadVideo(tenant, title, videoBuf, videoFilename, effectiveLucilleUrl);
+              results.videos.push({ title, price });
+              console.log(`[shoppe]   🎬 video: ${title}`);
+            }
+          } else {
+            results.warnings.push(`video "${title}": no video file found (expected .mp4/.mov/.mkv/.webm/.avi)`);
+          }
+        } catch (err) {
+          console.warn(`[shoppe]   ⚠️  video ${entry}: ${err.message}`);
+          results.warnings.push(`video "${entry}": ${err.message}`);
+        }
+      }
+    }
+
     // ---- appointments/ ----
     // Each subfolder is a bookable appointment type.
     // info.json: { title, description, price, duration (mins), timezone, availability[], advanceDays }
@@ -1053,6 +1365,148 @@ async function getSubscriptionStatus(tenant, productId, recoveryKey) {
 
 const CATEGORY_EMOJI = { book: '📚', music: '🎵', post: '📝', album: '🖼️', product: '📦', appointment: '📅', subscription: '🎁' };
 
+// ============================================================
+// OWNER ORDERS
+// ============================================================
+
+// Validate an owner-signed request (used for browser-facing owner routes).
+// Expects req.query.timestamp and req.query.signature.
+// Returns an error string if invalid, null if valid.
+function checkOwnerSignature(req, tenant) {
+  if (!tenant.ownerPubKey) return 'This shoppe was registered before owner signing was added';
+  const { timestamp, signature } = req.query;
+  if (!timestamp || !signature) return 'Missing timestamp or signature — generate a fresh URL with: node shoppe-sign.js orders';
+  const age = Date.now() - parseInt(timestamp, 10);
+  if (isNaN(age) || age < 0 || age > 5 * 60 * 1000) return 'URL has expired — generate a new one with: node shoppe-sign.js orders';
+  const message = timestamp + tenant.uuid;
+  if (!sessionless.verifySignature(signature, message, tenant.ownerPubKey)) return 'Signature invalid';
+  return null;
+}
+
+// Fetch all orders for every product belonging to a tenant.
+// Returns an array of { product, orders } objects.
+async function getAllOrders(tenant) {
+  const sanoraUrl  = getSanoraUrl();
+  const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
+  const products   = await productsResp.json();
+
+  sessionless.getKeys = () => tenant.keys;
+
+  const results = [];
+  for (const [title, product] of Object.entries(products)) {
+    const timestamp = Date.now().toString();
+    const signature = await sessionless.sign(timestamp + tenant.uuid);
+    try {
+      const resp = await fetch(
+        `${sanoraUrl}/user/${tenant.uuid}/orders/${encodeURIComponent(product.productId)}` +
+        `?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`
+      );
+      if (!resp.ok) continue;
+      const data = await resp.json();
+      const orders = data.orders || [];
+      if (orders.length > 0) results.push({ product, orders });
+    } catch { /* skip products with no order data */ }
+  }
+  return results;
+}
+
+function fmtDate(ts) {
+  return new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function generateOrdersHTML(tenant, orderData) {
+  const totalOrders  = orderData.reduce((n, p) => n + p.orders.length, 0);
+  const totalRevenue = orderData.reduce((n, p) =>
+    n + p.orders.reduce((m, o) => m + (o.amount || p.product.price || 0), 0), 0);
+
+  const sections = orderData.map(({ product, orders }) => {
+    const emoji = CATEGORY_EMOJI[product.category] || '🛍️';
+    const rows = orders.map(o => {
+      const date   = fmtDate(o.paidAt || o.createdAt || Date.now());
+      const amount = o.amount != null ? `$${(o.amount / 100).toFixed(2)}` : `$${((product.price || 0) / 100).toFixed(2)}`;
+      const detail = o.slot
+        ? `<span class="tag">📅 ${o.slot}</span>`
+        : o.renewalDays
+          ? `<span class="tag">🔄 ${o.renewalDays}d renewal</span>`
+          : '';
+      const keyHint = o.orderKey
+        ? `<span class="hash" title="sha256(recoveryKey+productId)">${o.orderKey.slice(0, 12)}…</span>`
+        : '—';
+      return `<tr><td>${date}</td><td>${amount}</td><td>${keyHint}</td><td>${detail}</td></tr>`;
+    }).join('');
+
+    return `
+    <div class="product-section">
+      <div class="product-header">
+        <span class="product-emoji">${emoji}</span>
+        <span class="product-title">${escHtml(product.title || 'Untitled')}</span>
+        <span class="order-count">${orders.length} order${orders.length !== 1 ? 's' : ''}</span>
+      </div>
+      <table>
+        <thead><tr><th>Date</th><th>Amount</th><th>Key hash</th><th>Details</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  }).join('');
+
+  const empty = totalOrders === 0
+    ? '<p class="empty">No orders yet. Share your shoppe link to get started!</p>'
+    : '';
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Orders — ${escHtml(tenant.name)}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f12; color: #e0e0e0; min-height: 100vh; }
+    header { background: linear-gradient(135deg, #1a1a2e, #0f3460); padding: 36px 32px 28px; }
+    header h1 { font-size: 26px; font-weight: 700; margin-bottom: 4px; }
+    header p  { font-size: 14px; color: #aaa; }
+    .stats { display: flex; gap: 20px; padding: 24px 32px; border-bottom: 1px solid #222; }
+    .stat { background: #18181c; border: 1px solid #333; border-radius: 12px; padding: 16px 24px; }
+    .stat-val { font-size: 28px; font-weight: 800; color: #7ec8e3; }
+    .stat-lbl { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+    .main { max-width: 900px; margin: 0 auto; padding: 28px 24px 60px; }
+    .product-section { margin-bottom: 32px; }
+    .product-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+    .product-emoji { font-size: 20px; }
+    .product-title { font-size: 17px; font-weight: 600; flex: 1; }
+    .order-count { font-size: 12px; color: #888; background: #222; border-radius: 10px; padding: 3px 10px; }
+    table { width: 100%; border-collapse: collapse; background: #18181c; border: 1px solid #2a2a2e; border-radius: 12px; overflow: hidden; }
+    thead { background: #222; }
+    th { padding: 10px 14px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #888; text-align: left; }
+    td { padding: 11px 14px; font-size: 13px; border-top: 1px solid #222; }
+    .hash { font-family: monospace; font-size: 12px; color: #7ec8e3; }
+    .tag  { background: #2a2a2e; border-radius: 6px; padding: 2px 8px; font-size: 12px; color: #ccc; }
+    .empty { color: #555; font-size: 15px; text-align: center; padding: 60px 0; }
+    .back { display: inline-block; margin-bottom: 20px; color: #7ec8e3; text-decoration: none; font-size: 13px; }
+    .back:hover { text-decoration: underline; }
+    .warning { background: #2a1f0a; border: 1px solid #665; border-radius: 10px; padding: 12px 16px; font-size: 13px; color: #cc9; margin-bottom: 24px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>${escHtml(tenant.emojicode)} ${escHtml(tenant.name)}</h1>
+    <p>Order history — this URL is valid for 5 minutes</p>
+  </header>
+  <div class="stats">
+    <div class="stat"><div class="stat-val">${totalOrders}</div><div class="stat-lbl">Total orders</div></div>
+    <div class="stat"><div class="stat-val">$${(totalRevenue / 100).toFixed(2)}</div><div class="stat-lbl">Total revenue</div></div>
+    <div class="stat"><div class="stat-val">${orderData.length}</div><div class="stat-lbl">Products sold</div></div>
+  </div>
+  <div class="main">
+    <a class="back" href="/plugin/shoppe/${tenant.uuid}">← Back to shoppe</a>
+    <div class="warning">🔑 Key hashes are shown (not recovery keys — those never reach this server). Revenue totals are approximate when order amounts aren't stored.</div>
+    ${empty}
+    ${sections}
+  </div>
+</body>
+</html>`;
+}
+
 function renderCards(items, category) {
   if (items.length === 0) {
     return '<p class="empty">Nothing here yet.</p>';
@@ -1230,11 +1684,51 @@ async function startServer(params) {
   // Register a new tenant (owner only)
   app.post('/plugin/shoppe/register', owner, async (req, res) => {
     try {
-      const tenant = await registerTenant(req.body.name);
-      res.json({ success: true, tenant });
+      const { uuid, emojicode, name, ownerPrivateKey, ownerPubKey } = await registerTenant(req.body.name);
+
+      // Generate a single-use, short-lived token for the starter bundle download.
+      const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
+      const token = crypto.randomBytes(24).toString('hex');
+      bundleTokens.set(token, { uuid, ownerPrivateKey, ownerPubKey, wikiOrigin, expiresAt: Date.now() + 15 * 60 * 1000 });
+
+      // Expire tokens automatically after 15 minutes.
+      setTimeout(() => bundleTokens.delete(token), 15 * 60 * 1000);
+
+      res.json({ success: true, tenant: { uuid, emojicode, name }, bundleToken: token });
     } catch (err) {
       console.error('[shoppe] register error:', err);
       res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // Starter bundle download — single-use token acts as the credential.
+  // The zip contains manifest.json, shoppe-key.json (private key), shoppe-sign.js, and empty content folders.
+  app.get('/plugin/shoppe/bundle/:token', (req, res) => {
+    const entry = bundleTokens.get(req.params.token);
+    if (!entry) {
+      return res.status(404).send('<h1>Bundle link expired or invalid</h1><p>Re-register to get a new link.</p>');
+    }
+    if (Date.now() > entry.expiresAt) {
+      bundleTokens.delete(req.params.token);
+      return res.status(410).send('<h1>Bundle link expired</h1><p>Re-register to get a new link.</p>');
+    }
+
+    // Invalidate immediately — single use
+    bundleTokens.delete(req.params.token);
+
+    const tenant = getTenantByIdentifier(entry.uuid);
+    if (!tenant) return res.status(404).send('<h1>Tenant not found</h1>');
+
+    try {
+      const buf = generateBundleBuffer(tenant, entry.ownerPrivateKey, entry.ownerPubKey, entry.wikiOrigin);
+      const filename = `${tenant.name.replace(/[^a-z0-9-]/gi, '-').toLowerCase()}-shoppe-starter.zip`;
+      res.set('Content-Type', 'application/zip');
+      res.set('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(buf);
+      console.log(`[shoppe] Starter bundle downloaded for "${tenant.name}" (${tenant.uuid})`);
+    } catch (err) {
+      console.error('[shoppe] bundle error:', err);
+      res.status(500).send('<h1>Error generating bundle</h1><p>' + err.message + '</p>');
     }
   });
 
@@ -1280,16 +1774,17 @@ async function startServer(params) {
   // Get config (owner only)
   app.get('/plugin/shoppe/config', owner, (req, res) => {
     const config = loadConfig();
-    res.json({ success: true, sanoraUrl: config.sanoraUrl || '' });
+    res.json({ success: true, sanoraUrl: config.sanoraUrl || '', lucilleUrl: config.lucilleUrl || '' });
   });
 
   // Save config (owner only)
   app.post('/plugin/shoppe/config', owner, (req, res) => {
-    const { sanoraUrl, addieUrl } = req.body;
+    const { sanoraUrl, addieUrl, lucilleUrl } = req.body;
     if (!sanoraUrl) return res.status(400).json({ success: false, error: 'sanoraUrl required' });
     const config = loadConfig();
     config.sanoraUrl = sanoraUrl;
     if (addieUrl) config.addieUrl = addieUrl;
+    if (lucilleUrl) config.lucilleUrl = lucilleUrl;
     saveConfig(config);
     console.log('[shoppe] Sanora URL set to:', sanoraUrl);
     res.json({ success: true });
@@ -1462,6 +1957,114 @@ async function startServer(params) {
     }
   });
 
+  // Owner orders page — authenticated via signed URL from shoppe-sign.js
+  app.get('/plugin/shoppe/:uuid/orders', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.uuid);
+      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+
+      const err = checkOwnerSignature(req, tenant);
+      if (err) {
+        return res.status(403).send(
+          `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f0f12;color:#e0e0e0">` +
+          `<h2>Access denied</h2><p style="color:#f66;margin-top:12px">${escHtml(err)}</p></body></html>`
+        );
+      }
+
+      const orderData = await getAllOrders(tenant);
+      res.set('Content-Type', 'text/html');
+      res.send(generateOrdersHTML(tenant, orderData));
+    } catch (err) {
+      console.error('[shoppe] orders page error:', err);
+      res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
+    }
+  });
+
+  // Owner payouts setup — validates owner sig, redirects to Stripe Connect Express onboarding
+  app.get('/plugin/shoppe/:uuid/payouts', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.uuid);
+      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+
+      const err = checkOwnerSignature(req, tenant);
+      if (err) {
+        return res.status(403).send(
+          `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f0f12;color:#e0e0e0">` +
+          `<h2>Access denied</h2><p style="color:#f66;margin-top:12px">${escHtml(err)}</p></body></html>`
+        );
+      }
+
+      if (!tenant.addieKeys) {
+        return res.status(500).send(
+          `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f0f12;color:#e0e0e0">` +
+          `<h2>Payment account not configured</h2><p>This shoppe has no Addie user. Re-register to get one.</p></body></html>`
+        );
+      }
+
+      const addieKeys = { pubKey: tenant.addieKeys.pubKey, privateKey: tenant.addieKeys.privateKey };
+      sessionless.getKeys = () => addieKeys;
+      const timestamp = Date.now().toString();
+      const message   = timestamp + tenant.addieKeys.uuid;
+      const signature = await sessionless.sign(message);
+
+      const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
+      const returnUrl  = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}/payouts/return`;
+
+      const resp = await fetch(`${getAddieUrl()}/user/${tenant.addieKeys.uuid}/processor/stripe/express`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timestamp, pubKey: tenant.addieKeys.pubKey, signature, returnUrl })
+      });
+      const json = await resp.json();
+
+      if (json.error) {
+        return res.status(500).send(
+          `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f0f12;color:#e0e0e0">` +
+          `<h2>Error setting up payouts</h2><p style="color:#f66;margin-top:12px">${escHtml(json.error)}</p></body></html>`
+        );
+      }
+
+      res.redirect(json.onboardingUrl);
+    } catch (err) {
+      console.error('[shoppe] payouts error:', err);
+      res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
+    }
+  });
+
+  // Stripe Connect Express return page — no auth, Stripe redirects here after onboarding
+  app.get('/plugin/shoppe/:uuid/payouts/return', (req, res) => {
+    const tenant = getTenantByIdentifier(req.params.uuid);
+    const name     = tenant ? escHtml(tenant.name) : 'your shoppe';
+    const shoppeUrl = tenant ? `/plugin/shoppe/${tenant.uuid}` : '/';
+    res.set('Content-Type', 'text/html');
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Payouts connected — ${name}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f12; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .card { background: #18181c; border: 1px solid #333; border-radius: 16px; padding: 48px 40px; max-width: 480px; text-align: center; }
+    h1 { font-size: 28px; font-weight: 700; margin-bottom: 12px; }
+    p  { color: #aaa; font-size: 15px; line-height: 1.6; margin-top: 10px; }
+    a  { display: inline-block; margin-top: 28px; color: #7ec8e3; text-decoration: none; font-size: 14px; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style="font-size:52px;margin-bottom:20px">✅</div>
+    <h1>Payouts connected!</h1>
+    <p>Your Stripe account is now linked to <strong>${name}</strong>.</p>
+    <p>Payments will be transferred to your account automatically after each sale.</p>
+    <a href="${escHtml(shoppeUrl)}">← Back to shoppe</a>
+  </div>
+</body>
+</html>`);
+  });
+
   // Membership portal page
   app.get('/plugin/shoppe/:identifier/membership', (req, res) => {
     const tenant = getTenantByIdentifier(req.params.identifier);
@@ -1535,7 +2138,7 @@ async function startServer(params) {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
 
-      const { recoveryKey, productId, title, slotDatetime } = req.body;
+      const { recoveryKey, productId, title, slotDatetime, payees: clientPayees } = req.body;
       if (!productId) return res.status(400).json({ error: 'productId required' });
       if (!recoveryKey && !title) return res.status(400).json({ error: 'recoveryKey or title required' });
 
@@ -1586,7 +2189,19 @@ async function startServer(params) {
       }
 
       // Sign and create Stripe intent via Addie
-      const payees = tenant.addieKeys ? [{ pubKey: tenant.addieKeys.pubKey, amount }] : [];
+      // Client may supply payees parsed from ?payees= URL param (pipe-separated 4-tuples).
+      // Each payee is capped at 5% of the product price; any that exceed this are dropped.
+      const maxPayeeAmount = amount * 0.05;
+      const validatedPayees = Array.isArray(clientPayees)
+        ? clientPayees.filter(p => {
+            if (p.percent != null && p.percent > 5) return false;
+            if (p.amount  != null && p.amount  > maxPayeeAmount) return false;
+            return true;
+          })
+        : [];
+      const payees = validatedPayees.length > 0
+        ? validatedPayees
+        : tenant.addieKeys ? [{ pubKey: tenant.addieKeys.pubKey, amount }] : [];
       const buyerKeys = { pubKey: buyer.pubKey, privateKey: buyer.privateKey };
       sessionless.getKeys = () => buyerKeys;
       const intentTimestamp = Date.now().toString();
@@ -1619,8 +2234,17 @@ async function startServer(params) {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
 
-      const { recoveryKey, productId, orderRef, address, title, amount, slotDatetime, contactInfo, type, renewalDays } = req.body;
+      const { recoveryKey, productId, orderRef, address, title, amount, slotDatetime, contactInfo, type, renewalDays, paymentIntentId } = req.body;
       const sanoraUrlInternal = getSanoraUrl();
+
+      // Fire transfer after successful payment — fire-and-forget, does not affect response
+      function triggerTransfer() {
+        if (!paymentIntentId || !tenant.addieKeys) return;
+        fetch(`${getAddieUrl()}/payment/${encodeURIComponent(paymentIntentId)}/process-transfers`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        }).catch(err => console.warn('[shoppe] transfer trigger failed:', err.message));
+      }
 
       if (recoveryKey && type === 'subscription') {
         // Subscription payment — record an order with a hashed subscriber key + payment timestamp.
@@ -1636,6 +2260,7 @@ async function startServer(params) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ timestamp: ts, signature: sig, order })
         });
+        triggerTransfer();
         return res.json({ success: true });
       }
 
@@ -1662,6 +2287,7 @@ async function startServer(params) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ timestamp: bookingTimestamp, signature: bookingSignature, order })
         });
+        triggerTransfer();
         return res.json({ success: true });
       }
 
@@ -1670,6 +2296,7 @@ async function startServer(params) {
         const recoveryHash = recoveryKey + productId;
         const createResp = await fetch(`${sanoraUrlInternal}/user/create-hash/${encodeURIComponent(recoveryHash)}/product/${encodeURIComponent(productId)}`);
         const createJson = await createResp.json();
+        triggerTransfer();
         return res.json({ success: createJson.success });
       }
 
@@ -1701,6 +2328,7 @@ async function startServer(params) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ timestamp: orderTimestamp, signature: orderSignature, order })
         });
+        triggerTransfer();
         return res.json({ success: true });
       }
 

@@ -151,6 +151,22 @@
   const AMOUNT        = {{amount}};
   const RENEWAL_DAYS  = {{renewalDays}};
 
+  // Parse ?payees=pubKey:amount:percent:addieUrl|... from the page URL.
+  function parseUrlPayees() {
+    const raw = new URLSearchParams(window.location.search).get('payees');
+    if (!raw) return null;
+    return raw.split('|').map(t => {
+      const [pubKey, amount, percent, addieUrl] = t.split(':');
+      const p = {};
+      if (pubKey)   p.pubKey   = pubKey;
+      if (amount)   p.amount   = Number(amount);
+      if (percent)  p.percent  = Number(percent);
+      if (addieUrl) p.addieUrl = addieUrl;
+      return p;
+    }).filter(p => p.pubKey);
+  }
+  const URL_PAYEES = parseUrlPayees();
+
   let stripe   = null;
   let elements = null;
 
@@ -170,7 +186,8 @@
       const resp = await fetch(`${SHOPPE_URL}/purchase/intent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recoveryKey, productId: PRODUCT_ID, title: TITLE })
+        body: JSON.stringify({ recoveryKey, productId: PRODUCT_ID, title: TITLE,
+          ...(URL_PAYEES && { payees: URL_PAYEES }) })
       });
       const data = await resp.json();
 
@@ -188,6 +205,7 @@
       document.getElementById('subscribe-form').style.display = 'none';
       document.getElementById('payment-section').style.display = 'block';
 
+      window.clientSecret = data.clientSecret;
       stripe   = Stripe(data.publishableKey);
       elements = stripe.elements({ clientSecret: data.clientSecret });
       elements.create('payment').mount('#payment-element');
@@ -221,6 +239,7 @@
       }
 
       const recoveryKey = document.getElementById('recovery-key').value.trim();
+      const paymentIntentId = window.clientSecret ? window.clientSecret.split('_secret_')[0] : undefined;
       const complete = await fetch(`${SHOPPE_URL}/purchase/complete`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -230,7 +249,8 @@
           title:       TITLE,
           amount:      AMOUNT,
           type:        'subscription',
-          renewalDays: RENEWAL_DAYS
+          renewalDays: RENEWAL_DAYS,
+          paymentIntentId
         })
       });
       await complete.json();

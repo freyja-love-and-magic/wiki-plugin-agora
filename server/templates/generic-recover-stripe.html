@@ -565,6 +565,23 @@
 </script>
 
 <script>
+  // Parse ?payees=pubKey:amount:percent:addieUrl|... from the page URL.
+  // Returns an array of payee objects, or null if the param is absent.
+  function parseUrlPayees() {
+    const raw = new URLSearchParams(window.location.search).get('payees');
+    if (!raw) return null;
+    return raw.split('|').map(t => {
+      const [pubKey, amount, percent, addieUrl] = t.split(':');
+      const p = {};
+      if (pubKey)   p.pubKey   = pubKey;
+      if (amount)   p.amount   = Number(amount);
+      if (percent)  p.percent  = Number(percent);
+      if (addieUrl) p.addieUrl = addieUrl;
+      return p;
+    }).filter(p => p.pubKey);
+  }
+  const URL_PAYEES = parseUrlPayees();
+
   const formConfig = {
       "Recovery": {type: "text", required: true},
       "Explanation": {type: "text-block", content: "Put whatever you want here, but make sure you remember it. This is how you'll be able to download this again."}
@@ -581,7 +598,8 @@
         const resp = await fetch('/plugin/shoppe/{{tenantUuid}}/purchase/intent', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ recoveryKey, productId: '{{productId}}', title: '{{title}}' })
+          body: JSON.stringify({ recoveryKey, productId: '{{productId}}', title: '{{title}}',
+            ...(URL_PAYEES && { payees: URL_PAYEES }) })
         });
         const json = await resp.json();
 
@@ -596,6 +614,7 @@
         }
 
         // Show payment element
+        window.clientSecret = json.clientSecret;
         document.getElementById('payment-section').style.display = 'block';
         stripe = Stripe(json.publishableKey);
         elements = stripe.elements({ clientSecret: json.clientSecret });
@@ -634,10 +653,11 @@
       if (error) return showError(error.message);
 
       const order = { title: '{{title}}', productId: '{{productId}}', formData: window.formData };
+      const paymentIntentId = window.clientSecret ? window.clientSecret.split('_secret_')[0] : undefined;
       const resp = await fetch('/plugin/shoppe/{{tenantUuid}}/purchase/complete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recoveryKey: window.formData.Recovery, productId: '{{productId}}', order })
+        body: JSON.stringify({ recoveryKey: window.formData.Recovery, productId: '{{productId}}', order, paymentIntentId })
       });
       const json = await resp.json();
 

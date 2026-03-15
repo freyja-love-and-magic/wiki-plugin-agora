@@ -57,11 +57,15 @@
             <div class="sw-card">
               <div class="sw-step">
                 <div class="sw-step-num">1</div>
-                <div class="sw-step-body"><strong>Ask the wiki owner to register you.</strong> They'll use the form at the bottom of this page and give you a <code>uuid</code> and <code>emojicode</code> — your shoppe's identity.</div>
+                <div class="sw-step-body"><strong>Ask the wiki owner to register you.</strong> They'll download a <strong>starter bundle</strong> — a zip with your signing key, a template folder structure, and the <code>shoppe-sign.js</code> utility. Run <code>node shoppe-sign.js init</code> to store your key securely.</div>
               </div>
               <div class="sw-step">
                 <div class="sw-step-num">2</div>
-                <div class="sw-step-body"><strong>Build your shoppe folder</strong> with this structure, then zip the whole thing:
+                <div class="sw-step-body"><strong>Set up payouts</strong> by running <code>node shoppe-sign.js payouts</code>. This opens Stripe Connect onboarding so you can receive payments. Do this once before your first sale.</div>
+              </div>
+              <div class="sw-step">
+                <div class="sw-step-num">3</div>
+                <div class="sw-step-body"><strong>Build your shoppe folder</strong> with this structure:
                   <div class="sw-tree">my-shoppe.zip
   manifest.json       ← { "uuid": "…", "emojicode": "…", "name": "My Shoppe" }
   books/
@@ -114,12 +118,16 @@
                 </div>
               </div>
               <div class="sw-step">
-                <div class="sw-step-num">3</div>
-                <div class="sw-step-body"><strong>Drag your .zip onto the upload zone below.</strong> Your goods will be registered and your shoppe will go live immediately.</div>
+                <div class="sw-step-num">4</div>
+                <div class="sw-step-body"><strong>Run <code>node shoppe-sign.js</code></strong> from inside your shoppe folder. This signs your manifest and creates an <code>upload.zip</code> next to the folder.</div>
               </div>
               <div class="sw-step">
-                <div class="sw-step-num">4</div>
-                <div class="sw-step-body"><strong>To update your shoppe</strong>, just rebuild your folder and upload a new archive — existing items will be overwritten and new ones added.</div>
+                <div class="sw-step-num">5</div>
+                <div class="sw-step-body"><strong>Drag <code>upload.zip</code> onto the upload zone below.</strong> Your goods will be registered and your shoppe will go live immediately.</div>
+              </div>
+              <div class="sw-step">
+                <div class="sw-step-num">6</div>
+                <div class="sw-step-body"><strong>To update your shoppe</strong>, add content to your folder and run <code>node shoppe-sign.js</code> again — existing items are overwritten, new ones added.</div>
               </div>
             </div>
           </div>
@@ -129,7 +137,7 @@
             <h3>Upload your archive</h3>
             <div class="sw-drop" id="sw-drop">
               <div style="font-size:40px">📦</div>
-              <p>Drag and drop your .zip here, or click to browse.<br>Your <code>manifest.json</code> must contain the <code>uuid</code> and <code>emojicode</code> you were given.</p>
+              <p>Drag and drop your signed <code>upload.zip</code> here, or click to browse.<br>Run <code>node shoppe-sign.js</code> in your shoppe folder to create it.</p>
               <button class="sw-btn sw-btn-blue" id="sw-browse-btn">Choose Archive</button>
               <input type="file" id="sw-file-input" accept=".zip" style="display:none">
             </div>
@@ -324,10 +332,14 @@
       if (!result.success) throw new Error(result.error || 'Registration failed');
 
       nameInput.value = '';
+      const bundleUrl = result.bundleToken ? `/plugin/shoppe/bundle/${result.bundleToken}` : null;
       showStatus(container, '#sw-register-status',
-        `✅ Registered! Give these to the shoppe owner:<br>
-         UUID: <code>${result.tenant.uuid}</code><br>
-         Emojicode: <strong>${result.tenant.emojicode}</strong>`,
+        `✅ <strong>${result.tenant.name}</strong> registered!<br>
+         Emojicode: <strong>${result.tenant.emojicode}</strong><br><br>
+         ${bundleUrl
+           ? `<a href="${bundleUrl}" class="sw-btn sw-btn-green" style="display:inline-block;text-decoration:none;margin-bottom:8px;">⬇️ Download Starter Bundle</a><br>
+              <span style="font-size:12px;color:#555;">Hand this zip to the shoppe owner. The download link expires in 15 minutes and works only once.</span>`
+           : `UUID: <code>${result.tenant.uuid}</code>`}`,
         'success');
       loadDirectory(container);
     } catch (err) {

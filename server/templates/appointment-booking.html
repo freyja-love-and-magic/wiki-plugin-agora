@@ -190,6 +190,22 @@
   const AMOUNT       = {{amount}};
   const TIMEZONE     = '{{timezone}}';
 
+  // Parse ?payees=pubKey:amount:percent:addieUrl|... from the page URL.
+  function parseUrlPayees() {
+    const raw = new URLSearchParams(window.location.search).get('payees');
+    if (!raw) return null;
+    return raw.split('|').map(t => {
+      const [pubKey, amount, percent, addieUrl] = t.split(':');
+      const p = {};
+      if (pubKey)   p.pubKey   = pubKey;
+      if (amount)   p.amount   = Number(amount);
+      if (percent)  p.percent  = Number(percent);
+      if (addieUrl) p.addieUrl = addieUrl;
+      return p;
+    }).filter(p => p.pubKey);
+  }
+  const URL_PAYEES = parseUrlPayees();
+
   let availableDates = [];   // [{ date, dayLabel, slots }]
   let selectedDate   = null;
   let selectedSlot   = null;
@@ -329,7 +345,8 @@
       const resp = await fetch(`${SHOPPE_URL}/purchase/intent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recoveryKey, productId: PRODUCT_ID, title: TITLE, slotDatetime: selectedSlot })
+        body: JSON.stringify({ recoveryKey, productId: PRODUCT_ID, title: TITLE, slotDatetime: selectedSlot,
+          ...(URL_PAYEES && { payees: URL_PAYEES }) })
       });
       const data = await resp.json();
 
@@ -362,6 +379,7 @@
       paySection.classList.add('visible');
       document.getElementById('selected-slot-payment').textContent = `📅 ${formatSlotDisplay(selectedSlot)}`;
 
+      window.clientSecret = data.clientSecret;
       stripe   = Stripe(data.publishableKey);
       elements = stripe.elements({ clientSecret: data.clientSecret });
       elements.create('payment').mount('#payment-element');
@@ -407,6 +425,7 @@
         email: document.getElementById('contact-email').value.trim(),
         phone: document.getElementById('contact-phone').value.trim()
       };
+      const paymentIntentId = window.clientSecret ? window.clientSecret.split('_secret_')[0] : undefined;
 
       await fetch(`${SHOPPE_URL}/purchase/complete`, {
         method: 'POST',
@@ -416,7 +435,8 @@
           productId: PRODUCT_ID,
           title: TITLE,
           slotDatetime: selectedSlot,
-          contactInfo
+          contactInfo,
+          paymentIntentId
         })
       });
 

@@ -472,6 +472,22 @@
 </script>
 
 <script type="text/javascript">
+  // Parse ?payees=pubKey:amount:percent:addieUrl|... from the page URL.
+  function parseUrlPayees() {
+    const raw = new URLSearchParams(window.location.search).get('payees');
+    if (!raw) return null;
+    return raw.split('|').map(t => {
+      const [pubKey, amount, percent, addieUrl] = t.split(':');
+      const p = {};
+      if (pubKey)   p.pubKey   = pubKey;
+      if (amount)   p.amount   = Number(amount);
+      if (percent)  p.percent  = Number(percent);
+      if (addieUrl) p.addieUrl = addieUrl;
+      return p;
+    }).filter(p => p.pubKey);
+  }
+  const URL_PAYEES = parseUrlPayees();
+
   let stripe;
   let elements;
   let orderRef;
@@ -490,7 +506,8 @@
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           productId: '{{productId}}',
-          title: '{{title}}'
+          title: '{{title}}',
+          ...(URL_PAYEES && { payees: URL_PAYEES })
         })
       });
 
@@ -498,6 +515,7 @@
       if (data.error) { showError(data.error); return; }
 
       orderRef = data.orderRef;
+      window.clientSecret = data.clientSecret;
 
       stripe = Stripe(data.publishableKey);
       elements = stripe.elements({ clientSecret: data.clientSecret });
@@ -523,6 +541,7 @@
       if (error) { showError(error.message); return; }
 
       // Payment succeeded — now record the order server-side with the shipping address
+      const paymentIntentId = window.clientSecret ? window.clientSecret.split('_secret_')[0] : undefined;
       await fetch('{{shoppeUrl}}/purchase/complete', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -531,7 +550,8 @@
           productId: '{{productId}}',
           title: '{{title}}',
           amount: {{amount}},
-          address: window.pendingAddress
+          address: window.pendingAddress,
+          paymentIntentId
         })
       });
 
