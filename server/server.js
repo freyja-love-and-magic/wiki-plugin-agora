@@ -2,6 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { execSync } = require('child_process');
 const fetch = require('node-fetch');
 const multer = require('multer');
 const FormData = require('form-data');
@@ -672,9 +673,15 @@ async function lucilleUploadVideo(tenant, title, fileBuffer, filename, lucilleUr
 // ============================================================
 
 async function processArchive(zipPath) {
-  const zip = new AdmZip(zipPath);
   const tmpDir = path.join(TMP_DIR, `extract-${Date.now()}`);
-  zip.extractAllTo(tmpDir, true);
+  fs.mkdirSync(tmpDir, { recursive: true });
+  // Use system unzip to stream-extract without loading entire archive into RAM.
+  // AdmZip loads the whole zip into memory upfront, which OOM-kills Node on large archives.
+  try {
+    execSync(`unzip -o "${zipPath}" -d "${tmpDir}"`, { stdio: 'pipe' });
+  } catch (err) {
+    throw new Error(`Failed to extract archive: ${err.stderr ? err.stderr.toString().trim() : err.message}`);
+  }
 
   try {
     // Find manifest.json — handle zips wrapped in a top-level folder and
