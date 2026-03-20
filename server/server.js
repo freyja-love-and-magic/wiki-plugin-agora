@@ -1186,8 +1186,13 @@ async function processArchive(zipPath, onProgress = () => {}) {
           const images = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
           const heroFile = images.find(f => /^hero\.(jpg|jpeg|png|webp)$/i.test(f)) || images[0];
           if (heroFile) {
-            const heroBuf = fs.readFileSync(path.join(entryPath, heroFile));
-            await sanoraUploadImage(tenant, title, heroBuf, heroFile);
+            try {
+              const heroBuf = fs.readFileSync(path.join(entryPath, heroFile));
+              await sanoraUploadImage(tenant, title, heroBuf, heroFile);
+            } catch (imgErr) {
+              console.warn(`[shoppe]   ⚠️  image upload for ${title}: ${imgErr.message}`);
+              results.warnings.push(`Image upload for "${title}" failed: ${imgErr.message}`);
+            }
           }
 
           results.products.push({ title, order, price, shipping });
@@ -3705,30 +3710,41 @@ async function startServer(params) {
     }
   });
 
-  // Music feed — adapts Sanora Canimus feed to { albums, tracks }
+  // Music feed — builds { albums, tracks } from Sanora products directly
   app.get('/plugin/shoppe/:identifier/music/feed', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
-      const feedResp = await fetchWithRetry(`${getSanoraUrl()}/feeds/music/${tenant.uuid}`, { timeout: 10000 });
-      if (!feedResp.ok) return res.status(502).json({ error: 'Feed unavailable' });
-      const feed = await feedResp.json();
+      const sanoraUrl = getSanoraUrl();
+      const productsResp = await fetchWithRetry(`${sanoraUrl}/products/${tenant.uuid}`, { timeout: 15000 });
+      if (!productsResp.ok) return res.status(502).json({ error: 'Could not load products' });
+      const products = await productsResp.json();
 
       const albums = [];
       const tracks = [];
-      for (const item of (feed.items || [])) {
-        const cover = (item.images && (item.images.cover?.url || item.images[0]?.url)) || null;
-        const mediaItems = (item.media || []).filter(m => m.url);
-        if (mediaItems.length === 0) continue;
-        if (mediaItems.length > 1) {
+      for (const [key, product] of Object.entries(products)) {
+        if (product.category !== 'music') continue;
+        const cover = product.image ? `${sanoraUrl}/images/${product.image}` : null;
+        const artifacts = product.artifacts || [];
+        if (artifacts.length > 1) {
           albums.push({
-            name: item.name,
+            name: product.title || key,
             cover,
-            description: item.summary || '',
-            tracks: mediaItems.map((m, i) => ({ number: i + 1, title: `Track ${i + 1}`, src: m.url, type: m.type || 'audio/mpeg' }))
+            description: product.description || '',
+            tracks: artifacts.map((a, i) => ({
+              number: i + 1,
+              title: `Track ${i + 1}`,
+              src: `${sanoraUrl}/artifacts/${a}`,
+              type: 'audio/mpeg'
+            }))
           });
-        } else {
-          tracks.push({ title: item.name, src: mediaItems[0].url, cover, description: item.summary || '' });
+        } else if (artifacts.length === 1) {
+          tracks.push({
+            title: product.title || key,
+            src: `${sanoraUrl}/artifacts/${artifacts[0]}`,
+            cover,
+            description: product.description || ''
+          });
         }
       }
       res.json({ albums, tracks });
