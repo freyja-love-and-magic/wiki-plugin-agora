@@ -3180,6 +3180,8 @@ async function startServer(params) {
         ? `${ebookUrl}?pubKey=${encodeURIComponent(buyerPubKey)}&timestamp=${encodeURIComponent(buyerTimestamp)}&signature=${encodeURIComponent(buyerSignature)}`
         : ebookUrl;
 
+      const clipUrl = `${wikiOrigin}${req.path}?${new URLSearchParams(req.query).toString()}`;
+
       const html = fillTemplate(templateHtml, {
         title:           product.title || title,
         description:     product.description || '',
@@ -3196,7 +3198,8 @@ async function startServer(params) {
         shoppeUrl,
         payees,
         tenantUuid:      tenant.uuid,
-        keywords:        extractKeywords(product)
+        keywords:        extractKeywords(product),
+        clipUrl,
       });
 
       res.set('Content-Type', 'text/html');
