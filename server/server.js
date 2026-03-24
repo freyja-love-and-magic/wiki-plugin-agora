@@ -107,6 +107,67 @@ async function getOrCreateBuyerAddieUser(recoveryKey, productId) {
   return buyer;
 }
 
+// ── Shoppere app: pubKey-based buyer auth ────────────────────────────────────
+
+// Verify a buyer-signed request from the Shoppere app.
+// Message convention: timestamp + pubKey  (mirrors Sessionless ecosystem standard)
+// Returns an error string on failure, null on success.
+function verifyBuyerSignature(pubKey, timestamp, signature, maxAgeMs = 5 * 60 * 1000) {
+  if (!pubKey || !timestamp || !signature) return 'pubKey, timestamp, and signature required';
+  const age = Date.now() - parseInt(timestamp, 10);
+  if (isNaN(age) || age < 0 || age > maxAgeMs) return 'Request expired';
+  if (!sessionless.verifySignature(signature, timestamp + pubKey, pubKey)) return 'Invalid signature';
+  return null;
+}
+
+// Like getOrCreateBuyerAddieUser but keyed by pubKey rather than a recoveryKey.
+// Prefixed 'pk:' in buyers.json to avoid collisions with legacy recovery-key entries.
+async function getOrCreateBuyerAddieUserByPubKey(pubKey, productId) {
+  const buyerKey = 'pk:' + pubKey + productId;
+  const buyers = loadBuyers();
+  if (buyers[buyerKey]) return buyers[buyerKey];
+
+  const addieKeys = await sessionless.generateKeys(() => {}, () => null);
+  sessionless.getKeys = () => addieKeys;
+  const timestamp = Date.now().toString();
+  const message = timestamp + addieKeys.pubKey;
+  const signature = await sessionless.sign(message);
+
+  const resp = await fetch(`${getAddieUrl()}/user/create`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ timestamp, pubKey: addieKeys.pubKey, signature })
+  });
+
+  const addieUser = await resp.json();
+  if (addieUser.error) throw new Error(`Addie: ${addieUser.error}`);
+
+  const buyer = { uuid: addieUser.uuid, pubKey: addieKeys.pubKey, privateKey: addieKeys.privateKey };
+  buyers[buyerKey] = buyer;
+  saveBuyers(buyers);
+  return buyer;
+}
+
+// Check whether a pubKey has a completed purchase for a productId by looking
+// for an order whose orderKey === sha256(pubKey + productId) in Sanora.
+async function hasPurchasedByPubKey(tenant, pubKey, productId) {
+  const orderKey = crypto.createHash('sha256').update(pubKey + productId).digest('hex');
+  const sanoraUrl = getSanoraUrl();
+  sessionless.getKeys = () => tenant.keys;
+  const timestamp = Date.now().toString();
+  const signature = await sessionless.sign(timestamp + tenant.uuid);
+  try {
+    const resp = await fetch(
+      `${sanoraUrl}/user/${tenant.uuid}/orders/${encodeURIComponent(productId)}` +
+      `?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`
+    );
+    const json = await resp.json();
+    return (json.orders || []).some(o => o.orderKey === orderKey);
+  } catch {
+    return false;
+  }
+}
+
 // Same diverse palette as BDO emojicoding
 const EMOJI_PALETTE = [
   '🌟', '🌙', '🌍', '🌊', '🔥', '💎', '🎨', '🎭', '🎪', '🎯',
@@ -1434,13 +1495,27 @@ async function getShoppeGoods(tenant) {
                 ? lucillePlayerUrl
                 : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`;
 
+    const resolvedUrl = (bucketName && redirects[bucketName]) || defaultUrl;
+
+    // Build clip URL for App Clip invocation — books and no-shipping products only.
+    // Appends product identity params so the App Clip can parse them from the URL.
+    const isClipBuyPage = !redirects[bucketName] && product.productId &&
+      (product.category === 'book' ||
+       (product.category === 'product' && !(product.shipping > 0)));
+    const clipUrl = isClipBuyPage
+      ? `${resolvedUrl}?productId=${encodeURIComponent(product.productId)}` +
+        `&price=${product.price || 0}` +
+        `&shopName=${encodeURIComponent(tenant.name || '')}`
+      : null;
+
     const item = {
       title: product.title || title,
       description: product.description || '',
       price: product.price || 0,
       shipping: product.shipping || 0,
       image: product.image ? `${getSanoraUrl()}/images/${product.image}` : null,
-      url: (bucketName && redirects[bucketName]) || defaultUrl,
+      url: resolvedUrl,
+      ...(clipUrl && { clipUrl }),
       ...(isPost && { category: product.category, tags: product.tags || '' }),
       ...(lucillePlayerUrl && { lucillePlayerUrl }),
       ...(product.category === 'video' && { shoppeId: tenant.uuid })
@@ -1778,9 +1853,12 @@ function renderCards(items, category) {
         </div>
       </div>`;
     }
+    // clipUrl is present for books and no-shipping products — it carries
+    // productId/price/shopName so the iOS App Clip can parse them on invocation.
+    const targetUrl = item.clipUrl || item.url;
     const clickHandler = isVideo
       ? `playVideo('${item.lucillePlayerUrl}')`
-      : `window.open('${item.url}','_blank')`;
+      : `window.open('${escHtml(targetUrl)}','_blank')`;
     return `
       <div class="card" onclick="${clickHandler}">
         ${imgHtml}
@@ -1819,6 +1897,9 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${tenant.name}</title>
   ${tenant.keywords ? `<meta name="keywords" content="${escHtml(tenant.keywords)}">` : ''}
+  <!-- Shoppere App Clip — shown as a Smart App Banner on iOS Safari -->
+  <meta name="apple-itunes-app"
+        content="app-id=6760954663, app-clip-bundle-id=app.foures.shoppere.shoppere, app-clip-display=card">
   <script src="https://js.stripe.com/v3/"></script>
   <style>
     /* ── Theme variables (dark default) ── */
@@ -2964,6 +3045,29 @@ async function startServer(params) {
     }
   });
 
+  // Apple App Clip associated domain verification.
+  // Apple fetches this file from /.well-known/apple-app-site-association on the wiki domain
+  // to confirm the App Clip is authorized to handle URLs on this host.
+  // Replace TEAM_ID with the Apple Developer Team ID (RLJ2FY35FD).
+  app.get('/.well-known/apple-app-site-association', (req, res) => {
+    res.set('Content-Type', 'application/json');
+    res.json({
+      applinks: {
+        details: [
+          {
+            appIDs: ['RLJ2FY35FD.app.foures.shoppere'],
+            components: [
+              { '/': '/plugin/shoppe/*', comment: 'All shoppe pages' }
+            ]
+          }
+        ]
+      },
+      appclips: {
+        apps: ['RLJ2FY35FD.app.foures.shoppere.shoppere']
+      }
+    });
+  });
+
   // Public directory — name, emojicode, and shoppe URL only
   app.get('/plugin/shoppe/directory', (req, res) => {
     const tenants = loadTenants();
@@ -3065,6 +3169,17 @@ async function startServer(params) {
         ? JSON.stringify([{ pubKey: tenant.addieKeys.pubKey, amount: product.price || 0 }])
         : '[]';
 
+      // Forward Shoppere App Clip credentials if present in the query string
+      const buyerPubKey    = req.query.pubKey    || '';
+      const buyerTimestamp = req.query.timestamp || '';
+      const buyerSignature = req.query.signature || '';
+
+      // When a pubKey credential is present, the download page can verify access via
+      // a signed request — embed the credentials so the template can redirect there.
+      const ebookUrlWithCreds = buyerPubKey
+        ? `${ebookUrl}?pubKey=${encodeURIComponent(buyerPubKey)}&timestamp=${encodeURIComponent(buyerTimestamp)}&signature=${encodeURIComponent(buyerSignature)}`
+        : ebookUrl;
+
       const html = fillTemplate(templateHtml, {
         title:           product.title || title,
         description:     product.description || '',
@@ -3072,11 +3187,12 @@ async function startServer(params) {
         amount:          String(product.price || 0),
         formattedAmount: ((product.price || 0) / 100).toFixed(2),
         productId:       product.productId || '',
-        pubKey:          '',
-        signature:       '',
+        buyerPubKey,
+        buyerTimestamp,
+        buyerSignature,
         sanoraUrl,
         allyabaseOrigin: wikiOrigin,
-        ebookUrl,
+        ebookUrl:        ebookUrlWithCreds,
         shoppeUrl,
         payees,
         tenantUuid:      tenant.uuid,
@@ -3391,9 +3507,15 @@ async function startServer(params) {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
 
-      const { recoveryKey, productId, title, slotDatetime, payees: clientPayees } = req.body;
+      const { recoveryKey, pubKey, timestamp: buyerTimestamp, signature: buyerSignature, productId, title, slotDatetime, payees: clientPayees } = req.body;
       if (!productId) return res.status(400).json({ error: 'productId required' });
-      if (!recoveryKey && !title) return res.status(400).json({ error: 'recoveryKey or title required' });
+      if (!pubKey && !recoveryKey && !title) return res.status(400).json({ error: 'pubKey (with timestamp+signature) or recoveryKey required' });
+
+      // Shoppere app path: verify the buyer's Sessionless signature before proceeding
+      if (pubKey) {
+        const sigErr = verifyBuyerSignature(pubKey, buyerTimestamp, buyerSignature);
+        if (sigErr) return res.status(401).json({ error: sigErr });
+      }
 
       const sanoraUrlInternal = getSanoraUrl();
 
@@ -3406,15 +3528,37 @@ async function startServer(params) {
       let buyer;
       let orderRef;
 
-      if (recoveryKey && product?.category === 'subscription') {
-        // Subscription flow — check if already actively subscribed
+      if (pubKey && product?.category === 'subscription') {
+        // Shoppere: subscription — check active status by pubKey orderKey
+        const alreadyPurchased = await hasPurchasedByPubKey(tenant, pubKey, productId);
+        if (alreadyPurchased) {
+          return res.json({ alreadySubscribed: true });
+        }
+        buyer = await getOrCreateBuyerAddieUserByPubKey(pubKey, productId);
+      } else if (pubKey && slotDatetime) {
+        // Shoppere: appointment — verify slot availability
+        const schedule = await getAppointmentSchedule(tenant, product);
+        if (schedule) {
+          const bookedSlots = await getBookedSlots(tenant, productId);
+          if (bookedSlots.includes(slotDatetime)) {
+            return res.status(409).json({ error: 'That time slot is no longer available.' });
+          }
+        }
+        buyer = await getOrCreateBuyerAddieUserByPubKey(pubKey, productId);
+      } else if (pubKey) {
+        // Shoppere: digital product — check if already purchased by pubKey
+        const alreadyPurchased = await hasPurchasedByPubKey(tenant, pubKey, productId);
+        if (alreadyPurchased) return res.json({ purchased: true });
+        buyer = await getOrCreateBuyerAddieUserByPubKey(pubKey, productId);
+      } else if (recoveryKey && product?.category === 'subscription') {
+        // Legacy recovery key: subscription flow — check if already actively subscribed
         const status = await getSubscriptionStatus(tenant, productId, recoveryKey);
         if (status.active) {
           return res.json({ alreadySubscribed: true, renewsAt: status.renewsAt, daysLeft: status.daysLeft });
         }
         buyer = await getOrCreateBuyerAddieUser(recoveryKey, productId);
       } else if (recoveryKey && slotDatetime) {
-        // Appointment flow — verify slot is still open before charging
+        // Legacy recovery key: appointment flow — verify slot is still open before charging
         const schedule = await getAppointmentSchedule(tenant, product);
         if (schedule) {
           const bookedSlots = await getBookedSlots(tenant, productId);
@@ -3424,7 +3568,7 @@ async function startServer(params) {
         }
         buyer = await getOrCreateBuyerAddieUser(recoveryKey, productId);
       } else if (recoveryKey) {
-        // Digital product flow — check if already purchased
+        // Legacy recovery key: digital product flow — check if already purchased
         const recoveryHash = recoveryKey + productId;
         const checkResp = await fetch(`${sanoraUrlInternal}/user/check-hash/${encodeURIComponent(recoveryHash)}/product/${encodeURIComponent(productId)}`);
         const checkJson = await checkResp.json();
@@ -3487,8 +3631,14 @@ async function startServer(params) {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
 
-      const { recoveryKey, productId, orderRef, address, title, amount, slotDatetime, contactInfo, type, renewalDays, paymentIntentId } = req.body;
+      const { recoveryKey, pubKey, timestamp: buyerTimestamp, signature: buyerSignature, productId, orderRef, address, title, amount, slotDatetime, contactInfo, type, renewalDays, paymentIntentId } = req.body;
       const sanoraUrlInternal = getSanoraUrl();
+
+      // Verify Shoppere signature if pubKey path
+      if (pubKey) {
+        const sigErr = verifyBuyerSignature(pubKey, buyerTimestamp, buyerSignature);
+        if (sigErr) return res.status(401).json({ error: sigErr });
+      }
 
       // Fire transfer after successful payment — fire-and-forget, does not affect response
       function triggerTransfer() {
@@ -3498,6 +3648,69 @@ async function startServer(params) {
           headers: { 'Content-Type': 'application/json' }
         }).catch(err => console.warn('[shoppe] transfer trigger failed:', err.message));
       }
+
+      // ── Shoppere app (pubKey) paths ───────────────────────────────────────
+
+      if (pubKey && type === 'subscription') {
+        // Shoppere subscription: orderKey = sha256(pubKey + productId)
+        const orderKey = crypto.createHash('sha256').update(pubKey + productId).digest('hex');
+        const tenantKeys = tenant.keys;
+        sessionless.getKeys = () => tenantKeys;
+        const ts  = Date.now().toString();
+        const sig = await sessionless.sign(ts + tenant.uuid);
+        const order = { orderKey, pubKey, paidAt: Date.now(), title, productId, renewalDays: renewalDays || 30, status: 'active' };
+        await fetch(`${sanoraUrlInternal}/user/${tenant.uuid}/orders`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timestamp: ts, signature: sig, order })
+        });
+        triggerTransfer();
+        return res.json({ success: true });
+      }
+
+      if (pubKey && slotDatetime) {
+        // Shoppere appointment: record booking with pubKey credential
+        const orderKey = crypto.createHash('sha256').update(pubKey + productId).digest('hex');
+        const tenantKeys = tenant.keys;
+        sessionless.getKeys = () => tenantKeys;
+        const bookingTimestamp = Date.now().toString();
+        const bookingSignature = await sessionless.sign(bookingTimestamp + tenant.uuid);
+        const order = {
+          orderKey,
+          pubKey,
+          productId,
+          title,
+          slot: slotDatetime,
+          contactInfo: contactInfo || {},
+          status: 'booked'
+        };
+        await fetch(`${sanoraUrlInternal}/user/${tenant.uuid}/orders`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timestamp: bookingTimestamp, signature: bookingSignature, order })
+        });
+        triggerTransfer();
+        return res.json({ success: true });
+      }
+
+      if (pubKey) {
+        // Shoppere digital product: record purchase with pubKey as credential
+        const orderKey = crypto.createHash('sha256').update(pubKey + productId).digest('hex');
+        const tenantKeys = tenant.keys;
+        sessionless.getKeys = () => tenantKeys;
+        const ts  = Date.now().toString();
+        const sig = await sessionless.sign(ts + tenant.uuid);
+        const order = { orderKey, pubKey, paidAt: Date.now(), title, productId, status: 'purchased' };
+        await fetch(`${sanoraUrlInternal}/user/${tenant.uuid}/orders`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timestamp: ts, signature: sig, order })
+        });
+        triggerTransfer();
+        return res.json({ success: true });
+      }
+
+      // ── Legacy recovery key paths ─────────────────────────────────────────
 
       if (recoveryKey && type === 'subscription') {
         // Subscription payment — record an order with a hashed subscriber key + payment timestamp.
@@ -3599,11 +3812,22 @@ async function startServer(params) {
       if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
 
       const title = decodeURIComponent(req.params.title);
+      const { pubKey, timestamp: buyerTimestamp, signature: buyerSignature } = req.query;
       const sanoraUrl = getSanoraUrl();
       const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
       const products = await productsResp.json();
       const product = products[title] || Object.values(products).find(p => p.title === title);
       if (!product) return res.status(404).send('<h1>Book not found</h1>');
+
+      // Verify access credential — either a valid Shoppere pubKey signature
+      // with a matching purchase record, or the legacy recovery hash (checked client-side
+      // in the download template itself via the existing hash endpoints).
+      if (pubKey) {
+        const sigErr = verifyBuyerSignature(pubKey, buyerTimestamp, buyerSignature);
+        if (sigErr) return res.status(401).send(`<h1>Access denied</h1><p>${sigErr}</p>`);
+        const purchased = await hasPurchasedByPubKey(tenant, pubKey, product.productId);
+        if (!purchased) return res.status(403).send('<h1>No purchase found for this key</h1>');
+      }
 
       const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
 
@@ -3620,8 +3844,8 @@ async function startServer(params) {
         description: product.description || '',
         image:       imageUrl,
         productId:   product.productId || '',
-        pubKey:      '',
-        signature:   '',
+        pubKey:      pubKey || '',
+        signature:   buyerSignature || '',
         epubPath,
         pdfPath,
         mobiPath
@@ -3693,6 +3917,64 @@ async function startServer(params) {
       const uploadUrl = `${lucilleBase}/user/${lucilleUuid}/video/${encodeURIComponent(title)}/file`;
       res.json({ uploadUrl, timestamp, signature });
     } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Shoppere app: purchases for a pubKey across all products on this shoppe.
+  // Auth: pubKey + timestamp + signature (Sessionless, 5-min TTL)
+  // Returns the subset of Sanora orders whose orderKey === sha256(pubKey + productId).
+  app.get('/plugin/shoppe/:identifier/purchases', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+
+      const { pubKey, timestamp, signature } = req.query;
+      const sigErr = verifyBuyerSignature(pubKey, timestamp, signature);
+      if (sigErr) return res.status(401).json({ error: sigErr });
+
+      const sanoraUrl = getSanoraUrl();
+      const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
+      if (!productsResp.ok) return res.status(502).json({ error: 'Could not reach Sanora' });
+      const products = await productsResp.json();
+
+      sessionless.getKeys = () => tenant.keys;
+      const purchases = [];
+
+      for (const [, product] of Object.entries(products)) {
+        if (!product.productId) continue;
+        const orderKey = crypto.createHash('sha256').update(pubKey + product.productId).digest('hex');
+        const ts  = Date.now().toString();
+        const sig = await sessionless.sign(ts + tenant.uuid);
+        try {
+          const ordersResp = await fetch(
+            `${sanoraUrl}/user/${tenant.uuid}/orders/${encodeURIComponent(product.productId)}` +
+            `?timestamp=${ts}&signature=${encodeURIComponent(sig)}`
+          );
+          const json = await ordersResp.json();
+          const match = (json.orders || []).find(o => o.orderKey === orderKey);
+          if (match) {
+            purchases.push({
+              productId:    product.productId,
+              title:        product.title,
+              category:     product.category,
+              image:        product.image ? `${sanoraUrl}/images/${product.image}` : null,
+              price:        product.price,
+              paidAt:       match.paidAt,
+              status:       match.status,
+              slot:         match.slot || null,
+              renewalDays:  match.renewalDays || null,
+              downloadUrl:  ['book', 'post', 'video'].includes(product.category)
+                ? `${reqProto(req)}://${req.get('host')}/plugin/shoppe/${tenant.uuid}/download/${encodeURIComponent(product.title)}`
+                : null,
+            });
+          }
+        } catch { /* skip products whose orders can't be fetched */ }
+      }
+
+      res.json({ success: true, shopName: tenant.name, purchases });
+    } catch (err) {
+      console.error('[shoppe] purchases error:', err);
       res.status(500).json({ error: err.message });
     }
   });
