@@ -9,6 +9,18 @@ const FormData = require('form-data');
 const AdmZip = require('adm-zip');
 const sessionless = require('sessionless-node');
 
+// Stripe is used directly for Terminal (card-present) payments.
+// Set STRIPE_SECRET_KEY in the environment. If absent, Terminal endpoints return 503.
+let _stripe = null;
+function getStripe() {
+  if (!_stripe) {
+    const key = process.env.STRIPE_SECRET_KEY;
+    if (!key) throw new Error('STRIPE_SECRET_KEY not set — Terminal payments unavailable');
+    _stripe = require('stripe')(key);
+  }
+  return _stripe;
+}
+
 const SHOPPE_BASE_EMOJI = process.env.SHOPPE_BASE_EMOJI || '🛍️🎨🎁';
 
 const TEMPLATES_DIR = path.join(__dirname, 'templates');
@@ -33,7 +45,8 @@ const BUYERS_FILE  = path.join(DATA_DIR, 'buyers.json');
 const CONFIG_FILE  = path.join(DATA_DIR, 'config.json');
 // Shipping addresses are stored locally only — never forwarded to Sanora or any third party.
 // This file contains PII (name, address). Purge individual records once orders ship.
-const ORDERS_FILE  = path.join(DATA_DIR, 'orders.json');
+const ORDERS_FILE     = path.join(DATA_DIR, 'orders.json');
+const AFFILIATES_FILE = path.join(DATA_DIR, 'affiliates.json');
 const TMP_DIR      = '/tmp/shoppe-uploads';
 
 // ============================================================
@@ -80,6 +93,48 @@ function loadBuyers() {
 function saveBuyers(buyers) {
   fs.writeFileSync(BUYERS_FILE, JSON.stringify(buyers, null, 2));
 }
+
+function loadAffiliates() {
+  if (!fs.existsSync(AFFILIATES_FILE)) return {};
+  try { return JSON.parse(fs.readFileSync(AFFILIATES_FILE, 'utf8')); } catch { return {}; }
+}
+
+function saveAffiliates(affiliates) {
+  fs.writeFileSync(AFFILIATES_FILE, JSON.stringify(affiliates, null, 2));
+}
+
+// Get or create an Addie user representing an affiliate (Shoppere user who initiates NFC charges).
+// Keyed by the affiliate's Shoppere pubKey. The affiliate's Addie account receives their cut of
+// split payments. Stripe Connect onboarding is a separate step handled outside this function.
+async function getOrCreateAffiliateAddieUser(shopperePublicKey) {
+  const affiliates = loadAffiliates();
+  if (affiliates[shopperePublicKey]) return affiliates[shopperePublicKey];
+
+  const addieKeys = await sessionless.generateKeys(() => {}, () => null);
+  sessionless.getKeys = () => addieKeys;
+  const timestamp = Date.now().toString();
+  const signature = await sessionless.sign(timestamp + addieKeys.pubKey);
+
+  const resp = await fetch(`${getAddieUrl()}/user/create`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ timestamp, pubKey: addieKeys.pubKey, signature })
+  });
+
+  const addieUser = await resp.json();
+  if (addieUser.error) throw new Error(`Addie affiliate create: ${addieUser.error}`);
+
+  const entry = {
+    uuid: addieUser.uuid,
+    pubKey: addieKeys.pubKey,
+    privateKey: addieKeys.privateKey,
+    shoppereKey: shopperePublicKey
+  };
+  affiliates[shopperePublicKey] = entry;
+  saveAffiliates(affiliates);
+  return entry;
+}
+
 
 async function getOrCreateBuyerAddieUser(recoveryKey, productId) {
   const buyerKey = recoveryKey + productId;
@@ -923,6 +978,10 @@ async function processArchive(zipPath, onProgress = () => {}) {
     if (manifest.lightMode !== undefined) {
       tenantUpdates.lightMode = !!manifest.lightMode;
     }
+    if (manifest.affiliateCommission != null && typeof manifest.affiliateCommission === 'number') {
+      // Clamp to [0, 0.50] — affiliates can earn at most 50% commission
+      tenantUpdates.affiliateCommission = Math.max(0, Math.min(0.50, manifest.affiliateCommission));
+    }
     if (Object.keys(tenantUpdates).length > 0) {
       const tenants = loadTenants();
       Object.assign(tenants[tenant.uuid], tenantUpdates);
@@ -1497,17 +1556,6 @@ async function getShoppeGoods(tenant) {
 
     const resolvedUrl = (bucketName && redirects[bucketName]) || defaultUrl;
 
-    // Build clip URL for App Clip invocation — books and no-shipping products only.
-    // Appends product identity params so the App Clip can parse them from the URL.
-    const isClipBuyPage = !redirects[bucketName] && product.productId &&
-      (product.category === 'book' ||
-       (product.category === 'product' && !(product.shipping > 0)));
-    const clipUrl = isClipBuyPage
-      ? `${resolvedUrl}?productId=${encodeURIComponent(product.productId)}` +
-        `&price=${product.price || 0}` +
-        `&shopName=${encodeURIComponent(tenant.name || '')}`
-      : null;
-
     const item = {
       title: product.title || title,
       description: product.description || '',
@@ -1515,7 +1563,6 @@ async function getShoppeGoods(tenant) {
       shipping: product.shipping || 0,
       image: product.image ? `${getSanoraUrl()}/images/${product.image}` : null,
       url: resolvedUrl,
-      ...(clipUrl && { clipUrl }),
       ...(isPost && { category: product.category, tags: product.tags || '' }),
       ...(lucillePlayerUrl && { lucillePlayerUrl }),
       ...(product.category === 'video' && { shoppeId: tenant.uuid })
@@ -1853,12 +1900,13 @@ function renderCards(items, category) {
         </div>
       </div>`;
     }
-    // clipUrl is present for books and no-shipping products — it carries
-    // productId/price/shopName so the iOS App Clip can parse them on invocation.
-    const targetUrl = item.clipUrl || item.url;
+    const targetUrl = item.url;
     const clickHandler = isVideo
       ? `playVideo('${item.lucillePlayerUrl}')`
       : `window.open('${escHtml(targetUrl)}','_blank')`;
+    const saveBtn = (item.price > 0 && item.productId)
+      ? `<button class="save-shoppere-btn" onclick="event.stopPropagation();saveToShoppere(${JSON.stringify(item.title)},${JSON.stringify(item.productId)},${item.price},${JSON.stringify(category)})" title="Save to Shoppere wallet">📱 Save</button>`
+      : '';
     return `
       <div class="card" onclick="${clickHandler}">
         ${imgHtml}
@@ -1866,6 +1914,7 @@ function renderCards(items, category) {
           <div class="card-title">${item.title}</div>
           ${item.description ? `<div class="card-desc">${item.description}</div>` : ''}
           ${priceHtml}
+          ${saveBtn}
         </div>
       </div>`;
   }).join('');
@@ -1897,9 +1946,21 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${tenant.name}</title>
   ${tenant.keywords ? `<meta name="keywords" content="${escHtml(tenant.keywords)}">` : ''}
-  <!-- Shoppere App Clip — shown as a Smart App Banner on iOS Safari -->
-  <meta name="apple-itunes-app"
-        content="app-id=6760954663, app-clip-bundle-id=app.foures.shoppere.shoppere, app-clip-display=card">
+  <script>
+    const _shoppeId   = ${JSON.stringify(tenant.uuid)};
+    const _shoppeName = ${JSON.stringify(tenant.name)};
+    function saveToShoppere(title, productId, price, category) {
+      const url = 'shoppere://product?'
+        + 'd=' + encodeURIComponent(window.location.hostname)
+        + '&s=' + encodeURIComponent(_shoppeId)
+        + '&n=' + encodeURIComponent(_shoppeName)
+        + '&t=' + encodeURIComponent(title)
+        + '&i=' + encodeURIComponent(productId || title)
+        + '&p=' + price
+        + '&c=' + encodeURIComponent(category);
+      window.location.href = url;
+    }
+  </script>
   <script src="https://js.stripe.com/v3/"></script>
   <style>
     /* ── Theme variables (dark default) ── */
@@ -1979,6 +2040,8 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
     .card-desc { font-size: 13px; color: var(--text-2); margin-bottom: 8px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
     .price { font-size: 15px; font-weight: 700; color: var(--accent); }
     .shipping { font-size: 12px; font-weight: 400; color: var(--text-3); }
+    .save-shoppere-btn { margin-top: 8px; background: none; border: 1px solid var(--border); border-radius: 14px; color: var(--text-3); font-size: 11px; padding: 4px 10px; cursor: pointer; display: inline-block; }
+    .save-shoppere-btn:active { opacity: 0.6; }
     .empty { color: var(--text-3); text-align: center; padding: 60px 0; font-size: 15px; }
     .card-video-play { position: relative; }
     .card-video-play::after { content: '▶'; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 36px; color: rgba(255,255,255,0.9); background: rgba(0,0,0,0.35); opacity: 0; transition: opacity 0.2s; pointer-events: none; }
@@ -2250,7 +2313,7 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
       const standaloneHtml = standalones.length ? \`
         \${series.length ? '<div class="posts-standalones-label">Posts</div>' : ''}
         <div class="posts-grid">\${standalones.map(p => \`
-          <div class="card" onclick="window.open('\${_escHtml(p.url)}','_self')">
+          <div class="card" style="cursor:pointer" onclick="window.location.href='\${_escHtml(p.url)}'">
             \${p.image ? \`<div class="card-img"><img src="\${_escHtml(p.image)}" alt="" loading="lazy"></div>\` : '<div class="card-img-placeholder">📝</div>'}
             <div class="card-body">
               <div class="card-title">\${_escHtml(p.title)}</div>
@@ -3045,29 +3108,6 @@ async function startServer(params) {
     }
   });
 
-  // Apple App Clip associated domain verification.
-  // Apple fetches this file from /.well-known/apple-app-site-association on the wiki domain
-  // to confirm the App Clip is authorized to handle URLs on this host.
-  // Replace TEAM_ID with the Apple Developer Team ID (RLJ2FY35FD).
-  app.get('/.well-known/apple-app-site-association', (req, res) => {
-    res.set('Content-Type', 'application/json');
-    res.json({
-      applinks: {
-        details: [
-          {
-            appIDs: ['RLJ2FY35FD.app.foures.shoppere'],
-            components: [
-              { '/': '/plugin/shoppe/*', comment: 'All shoppe pages' }
-            ]
-          }
-        ]
-      },
-      appclips: {
-        apps: ['RLJ2FY35FD.app.foures.shoppere.shoppere']
-      }
-    });
-  });
-
   // Public directory — name, emojicode, and shoppe URL only
   app.get('/plugin/shoppe/directory', (req, res) => {
     const tenants = loadTenants();
@@ -3169,7 +3209,7 @@ async function startServer(params) {
         ? JSON.stringify([{ pubKey: tenant.addieKeys.pubKey, amount: product.price || 0 }])
         : '[]';
 
-      // Forward Shoppere App Clip credentials if present in the query string
+      // Forward Shoppere credentials if present in the query string
       const buyerPubKey    = req.query.pubKey    || '';
       const buyerTimestamp = req.query.timestamp || '';
       const buyerSignature = req.query.signature || '';
@@ -3179,8 +3219,6 @@ async function startServer(params) {
       const ebookUrlWithCreds = buyerPubKey
         ? `${ebookUrl}?pubKey=${encodeURIComponent(buyerPubKey)}&timestamp=${encodeURIComponent(buyerTimestamp)}&signature=${encodeURIComponent(buyerSignature)}`
         : ebookUrl;
-
-      const clipUrl = `${wikiOrigin}${req.path}?${new URLSearchParams(req.query).toString()}`;
 
       const html = fillTemplate(templateHtml, {
         title:           product.title || title,
@@ -3199,7 +3237,8 @@ async function startServer(params) {
         payees,
         tenantUuid:      tenant.uuid,
         keywords:        extractKeywords(product),
-        clipUrl,
+        shopName:        tenant.name || '',
+        category:        product.category || 'book',
       });
 
       res.set('Content-Type', 'text/html');
@@ -3510,7 +3549,8 @@ async function startServer(params) {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
 
-      const { recoveryKey, pubKey, timestamp: buyerTimestamp, signature: buyerSignature, productId, title, slotDatetime, payees: clientPayees } = req.body;
+      const { recoveryKey, pubKey, timestamp: buyerTimestamp, signature: buyerSignature, productId, title, slotDatetime, payees: clientPayees,
+              affiliatePubKey } = req.body;
       if (!productId) return res.status(400).json({ error: 'productId required' });
       if (!pubKey && !recoveryKey && !title) return res.status(400).json({ error: 'pubKey (with timestamp+signature) or recoveryKey required' });
 
@@ -3588,20 +3628,37 @@ async function startServer(params) {
         return res.json({ free: true });
       }
 
-      // Sign and create Stripe intent via Addie
-      // Client may supply payees parsed from ?payees= URL param (pipe-separated 4-tuples).
-      // Each payee is capped at 5% of the product price; any that exceed this are dropped.
-      const maxPayeeAmount = amount * 0.05;
-      const validatedPayees = Array.isArray(clientPayees)
-        ? clientPayees.filter(p => {
-            if (p.percent != null && p.percent > 5) return false;
-            if (p.amount  != null && p.amount  > maxPayeeAmount) return false;
-            return true;
-          })
-        : [];
-      const payees = validatedPayees.length > 0
-        ? validatedPayees
-        : tenant.addieKeys ? [{ pubKey: tenant.addieKeys.pubKey, amount }] : [];
+      // Build payees for Addie.
+      // If an affiliate pubKey is present (NFC proximity charge / referral link flow),
+      // split: affiliate gets affiliateCommission %, tenant gets the rest.
+      // Addie enforces its own signing — we just pass pubKeys as payees.
+      let payees;
+      if (affiliatePubKey) {
+        const affiliateCommission = tenant.affiliateCommission ?? 0.10;
+        const affiliateAmount = Math.floor(amount * affiliateCommission);
+        const tenantAmount = amount - affiliateAmount;
+
+        const affiliateAddieUser = await getOrCreateAffiliateAddieUser(affiliatePubKey);
+        payees = tenant.addieKeys
+          ? [
+              { pubKey: tenant.addieKeys.pubKey, amount: tenantAmount },
+              { pubKey: affiliateAddieUser.pubKey, amount: affiliateAmount }
+            ]
+          : [{ pubKey: affiliateAddieUser.pubKey, amount }];
+      } else {
+        // Standard flow — optionally accept client-supplied payees capped at 5% each
+        const maxPayeeAmount = amount * 0.05;
+        const validatedPayees = Array.isArray(clientPayees)
+          ? clientPayees.filter(p => {
+              if (p.percent != null && p.percent > 5) return false;
+              if (p.amount  != null && p.amount  > maxPayeeAmount) return false;
+              return true;
+            })
+          : [];
+        payees = validatedPayees.length > 0
+          ? validatedPayees
+          : tenant.addieKeys ? [{ pubKey: tenant.addieKeys.pubKey, amount }] : [];
+      }
       const buyerKeys = { pubKey: buyer.pubKey, privateKey: buyer.privateKey };
       sessionless.getKeys = () => buyerKeys;
       const intentTimestamp = Date.now().toString();
@@ -3808,6 +3865,149 @@ async function startServer(params) {
     }
   });
 
+  // ── Stripe Terminal routes ─────────────────────────────────────────────────
+
+  app.get('/plugin/shoppe/:identifier/terminal/connection-token', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      const stripe = getStripe();
+      const token = await stripe.terminal.connectionTokens.create();
+      res.json({ secret: token.secret });
+    } catch (err) {
+      const status = err.message.includes('STRIPE_SECRET_KEY') ? 503 : 500;
+      res.status(status).json({ error: err.message });
+    }
+  });
+
+  app.post('/plugin/shoppe/:identifier/terminal/payment-intent', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+
+      const { amount, currency = 'usd', productId, productTitle, affiliatePubKey } = req.body;
+      if (!amount || amount <= 0) return res.status(400).json({ error: 'amount required' });
+
+      const stripe = getStripe();
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount,
+        currency,
+        payment_method_types: ['card_present'],
+        capture_method: 'manual',
+        description: productTitle || 'Shoppere charge',
+        metadata: {
+          shopId:          tenant.uuid,
+          productId:       productId       || '',
+          affiliatePubKey: affiliatePubKey || '',
+        },
+      });
+
+      res.json({ paymentIntentId: paymentIntent.id, clientSecret: paymentIntent.client_secret });
+    } catch (err) {
+      console.error('[shoppe] terminal payment-intent error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/plugin/shoppe/:identifier/terminal/capture', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+
+      const { paymentIntentId, productId, productTitle, buyerInfo } = req.body;
+      if (!paymentIntentId) return res.status(400).json({ error: 'paymentIntentId required' });
+
+      const stripe = getStripe();
+
+      // Capture the card-present payment
+      const pi = await stripe.paymentIntents.capture(paymentIntentId);
+      const chargeId = typeof pi.latest_charge === 'string' ? pi.latest_charge : pi.latest_charge?.id;
+      const amount   = pi.amount_received || pi.amount;
+
+      // Retrieve affiliate info from PI metadata
+      const affiliatePubKey = pi.metadata?.affiliatePubKey || '';
+
+      // Split funds via Stripe Transfers if Stripe account IDs are available
+      const affiliateCommission = tenant.affiliateCommission ?? 0.10;
+      const affiliateAmount     = Math.floor(amount * affiliateCommission);
+      const tenantAmount        = amount - affiliateAmount;
+
+      const transferBase = chargeId ? { source_transaction: chargeId, transfer_group: paymentIntentId } : { transfer_group: paymentIntentId };
+
+      if (tenant.stripeAccountId && tenantAmount > 0) {
+        stripe.transfers.create({ amount: tenantAmount, currency: 'usd', destination: tenant.stripeAccountId, ...transferBase })
+          .catch(e => console.warn('[shoppe] tenant transfer failed:', e.message));
+      }
+
+      if (affiliatePubKey) {
+        const affiliates = loadAffiliates();
+        const aff = affiliates[affiliatePubKey];
+        if (aff?.stripeAccountId && affiliateAmount > 0) {
+          stripe.transfers.create({ amount: affiliateAmount, currency: 'usd', destination: aff.stripeAccountId, ...transferBase })
+            .catch(e => console.warn('[shoppe] affiliate transfer failed:', e.message));
+        }
+      }
+
+      // Record order in Sanora (fire-and-forget)
+      if (productId && tenant.keys) {
+        const ts = Date.now().toString();
+        sessionless.getKeys = () => tenant.keys;
+        const orderSig = await sessionless.sign(ts + tenant.uuid).catch(() => null);
+        if (orderSig) {
+          const order = {
+            productId,
+            title: productTitle || productId,
+            paidAt: ts,
+            paymentIntentId,
+            channel: 'terminal',
+            buyerInfo: buyerInfo || null,
+          };
+          fetch(`${getSanoraUrl()}/user/orders`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ timestamp: ts, order, signature: orderSig }),
+          }).catch(() => {});
+        }
+      }
+
+      res.json({ success: true, amount, affiliateAmount, tenantAmount });
+    } catch (err) {
+      console.error('[shoppe] terminal capture error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Called after Stripe Connect onboarding to link a Stripe account to the tenant or affiliate.
+  // body: { type: 'tenant' | 'affiliate', stripeAccountId, pubKey? (for affiliate) }
+  app.post('/plugin/shoppe/:identifier/terminal/stripe-account', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+
+      const { type, stripeAccountId, pubKey } = req.body;
+      if (!stripeAccountId) return res.status(400).json({ error: 'stripeAccountId required' });
+
+      if (type === 'tenant') {
+        const tenants = loadTenants();
+        tenants[tenant.uuid].stripeAccountId = stripeAccountId;
+        saveTenants(tenants);
+        return res.json({ ok: true });
+      }
+
+      if (type === 'affiliate' && pubKey) {
+        const affiliates = loadAffiliates();
+        if (!affiliates[pubKey]) return res.status(404).json({ error: 'Affiliate not found — they must initiate a charge first' });
+        affiliates[pubKey].stripeAccountId = stripeAccountId;
+        saveAffiliates(affiliates);
+        return res.json({ ok: true });
+      }
+
+      res.status(400).json({ error: 'type must be tenant or affiliate (with pubKey)' });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Ebook download page (reached after successful payment + hash creation)
   app.get('/plugin/shoppe/:identifier/download/:title', async (req, res) => {
     try {
@@ -3871,11 +4071,11 @@ async function startServer(params) {
       const title = decodeURIComponent(req.params.title);
       const productsResp = await fetch(`${getSanoraUrl()}/products/${tenant.uuid}`);
       const products = await productsResp.json();
-      const product = products[title];
+      const product = products[title] || Object.values(products).find(p => p.title === title);
       if (!product) return res.status(404).send('<h1>Post not found</h1>');
 
       // Find the markdown artifact (UUID-named .md file)
-      const mdArtifact = (product.artifacts || []).find(a => a.endsWith('.md'));
+      const mdArtifact = (product.artifacts || []).find(a => a.includes('.md'));
       let mdContent = '';
       if (mdArtifact) {
         const artResp = await fetch(`${getSanoraUrl()}/artifacts/${mdArtifact}`);

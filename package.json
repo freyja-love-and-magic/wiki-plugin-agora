@@ -1,6 +1,6 @@
 {
   "name": "wiki-plugin-shoppe",
-  "version": "0.0.37",
+  "version": "0.0.39",
   "description": "Multi-tenant digital goods shoppe for federated wiki, powered by Sanora",
   "keywords": [
     "wiki",
@@ -26,6 +26,7 @@
     "form-data": "^4.0.0",
     "multer": "^1.4.5-lts.1",
     "node-fetch": "^2.6.1",
-    "sessionless-node": "latest"
+    "sessionless-node": "latest",
+    "stripe": "^17"
   }
 }

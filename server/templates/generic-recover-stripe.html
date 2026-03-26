@@ -4,9 +4,6 @@
   <script src="https://js.stripe.com/v3/"></script>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.00, maximum-scale=1.00, minimum-scale=1.00">
-  <!-- Shoppere App Clip — triggers on iOS Safari when user visits this buy page -->
-  <meta name="apple-itunes-app"
-        content="app-id=6760954663, app-clip-bundle-id=app.foures.shoppere.shoppere, app-clip-display=card, app-clip-url={{clipUrl}}">
   <meta name="twitter:title" content="{{title}}">
   <meta name="description" content="{{description}}">
   <meta name="keywords" content="{{keywords}}">
@@ -114,6 +111,15 @@
       <h1>{{title}}</h1>
       <p>{{description}}</p>
       <button class="buy-btn" id="buy-button">BUY NOW — ${{formattedAmount}}</button>
+      <div id="shoppere-btn-wrap" style="margin-top:16px;display:none;">
+        <a id="shoppere-open-link" href="#"
+           style="display:block;width:100%;max-width:400px;margin:0 auto;padding:18px 40px;background:linear-gradient(135deg,#7ec8e3,#4a90b8);color:#0f0f12;border-radius:50px;font-size:clamp(1rem,3.5vw,1.3rem);font-weight:bold;text-align:center;text-decoration:none;box-shadow:0 8px 32px rgba(126,200,227,0.25);">
+          Open in Shoppere
+        </a>
+        <p style="text-align:center;margin-top:10px;font-size:12px;color:#666;">
+          Don't have Shoppere? <a href="https://apps.apple.com/app/id6760954663" style="color:#7ec8e3;">Download on the App Store</a>
+        </p>
+      </div>
     </div>
   </div>
 
@@ -192,12 +198,14 @@
 
 <!-- ── Shoppere (pubKey) path ────────────────────────────────────────────── -->
 <script>
-  // Credentials injected by the server from req.query, or read from URL params
-  // (the App Clip appends them when redirecting back to the buy page).
+  // Credentials injected by the server from req.query, or read from URL params.
   const _buyerPubKey    = '{{buyerPubKey}}' || new URLSearchParams(window.location.search).get('pubKey')    || '';
   const _buyerTimestamp = '{{buyerTimestamp}}' || new URLSearchParams(window.location.search).get('timestamp') || '';
   const _buyerSignature = '{{buyerSignature}}' || new URLSearchParams(window.location.search).get('signature') || '';
   const IS_SHOPPERE = !!(_buyerPubKey && _buyerTimestamp && _buyerSignature);
+  // Affiliate (NFC proximity charge / referral link) param — present when buyer arrived via a referred link
+  const _affiliatePubKey = new URLSearchParams(window.location.search).get('affiliatePubKey') || '';
+  const IS_AFFILIATE_CHARGE = !!_affiliatePubKey;
 
   let _shoppereStripe, _shoppereElements, _shoppereClientSecret;
 
@@ -220,7 +228,8 @@
           signature: _buyerSignature,
           productId: '{{productId}}',
           title:     '{{title}}',
-          ...(URL_PAYEES && { payees: URL_PAYEES })
+          ...(URL_PAYEES && { payees: URL_PAYEES }),
+          ...(IS_AFFILIATE_CHARGE && { affiliatePubKey: _affiliatePubKey })
         })
       });
       const json = await resp.json();
@@ -314,6 +323,21 @@
   // Route on load
   if (IS_SHOPPERE) {
     document.addEventListener('DOMContentLoaded', initShopperePath);
+  } else {
+    // Show the "Open in Shoppere" button with the deep link URL
+    document.addEventListener('DOMContentLoaded', function() {
+      const deepLink = 'shoppere://buy?' + new URLSearchParams({
+        domain:       window.location.hostname,
+        shopId:       '{{tenantUuid}}',
+        shopName:     '{{shopName}}',
+        productTitle: '{{title}}',
+        productId:    '{{productId}}',
+        price:        '{{amount}}',
+        category:     '{{category}}',
+      }).toString();
+      document.getElementById('shoppere-open-link').href = deepLink;
+      document.getElementById('shoppere-btn-wrap').style.display = 'block';
+    });
   }
 </script>
 
@@ -448,7 +472,7 @@
       const container = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
       container.setAttribute('viewBox', `0 0 500 ${h + 100}`);
       container.setAttribute('width', '100%');
-      container.setAttribute('height', 'auto');
+      container.style.height = 'auto';
       container.innerHTML = getBackgroundAndGradients(formJSON) + inputs.join('');
 
       setTimeout(() => {
