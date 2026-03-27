@@ -3005,6 +3005,19 @@ async function startServer(params) {
   if (!fs.existsSync(TMP_DIR))  fs.mkdirSync(TMP_DIR,  { recursive: true });
   console.log('🛍️  wiki-plugin-shoppe starting...');
 
+  // Allow Shoppere desktop/mobile app (tauri://localhost) to call our JSON API
+  const SHOPPERE_ORIGINS = ['tauri://localhost', 'https://tauri.localhost'];
+  app.use('/plugin/shoppe', (req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && SHOPPERE_ORIGINS.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      if (req.method === 'OPTIONS') return res.sendStatus(200);
+    }
+    next();
+  });
+
   const owner = (req, res, next) => {
     if (!app.securityhandler.isAuthorized(req)) {
       return res.status(401).json({ error: 'must be owner' });
@@ -3767,7 +3780,15 @@ async function startServer(params) {
           body: JSON.stringify({ timestamp: ts, signature: sig, order })
         });
         triggerTransfer();
-        return res.json({ success: true });
+        // Return a download URL for digital goods so the Shoppere app can open the content
+        const sanoraUrl = getSanoraUrl();
+        const products = await fetchWithRetry(`${sanoraUrl}/products/${tenant.uuid}`).then(r => r.ok ? r.json() : {});
+        const product = Object.values(products).find(p => p.uuid === productId || p.title === title);
+        let downloadUrl = null;
+        if (product && ['book', 'post', 'video'].includes(product.category)) {
+          downloadUrl = `https://${req.get('host')}/plugin/shoppe/${tenant.uuid}/download/${encodeURIComponent(product.title)}`;
+        }
+        return res.json({ success: true, downloadUrl });
       }
 
       // ── Legacy recovery key paths ─────────────────────────────────────────
