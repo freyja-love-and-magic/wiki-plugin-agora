@@ -193,7 +193,7 @@
       return p;
     }).filter(p => p.pubKey);
   }
-  const URL_PAYEES = parseUrlPayees();
+  var URL_PAYEES = parseUrlPayees();
 </script>
 
 <!-- ── Shoppere (pubKey) path ────────────────────────────────────────────── -->
@@ -202,7 +202,7 @@
   const _buyerPubKey    = '{{buyerPubKey}}' || new URLSearchParams(window.location.search).get('pubKey')    || '';
   const _buyerTimestamp = '{{buyerTimestamp}}' || new URLSearchParams(window.location.search).get('timestamp') || '';
   const _buyerSignature = '{{buyerSignature}}' || new URLSearchParams(window.location.search).get('signature') || '';
-  const IS_SHOPPERE = !!(_buyerPubKey && _buyerTimestamp && _buyerSignature);
+  var IS_SHOPPERE = !!(_buyerPubKey && _buyerTimestamp && _buyerSignature);
   // Affiliate (NFC proximity charge / referral link) param — present when buyer arrived via a referred link
   const _affiliatePubKey = new URLSearchParams(window.location.search).get('affiliatePubKey') || '';
   const IS_AFFILIATE_CHARGE = !!_affiliatePubKey;
@@ -227,7 +227,7 @@
           timestamp: _buyerTimestamp,
           signature: _buyerSignature,
           productId: '{{productId}}',
-          title:     '{{title}}',
+          title:     {{title_json}},
           ...(URL_PAYEES && { payees: URL_PAYEES }),
           ...(IS_AFFILIATE_CHARGE && { affiliatePubKey: _affiliatePubKey })
         })
@@ -294,7 +294,7 @@
           timestamp: _buyerTimestamp,
           signature: _buyerSignature,
           productId: '{{productId}}',
-          title:     '{{title}}',
+          title:     {{title_json}},
           ...(paymentIntentId && { paymentIntentId })
         })
       });
@@ -329,8 +329,8 @@
       const deepLink = 'shoppere://buy?' + new URLSearchParams({
         domain:       window.location.hostname,
         shopId:       '{{tenantUuid}}',
-        shopName:     '{{shopName}}',
-        productTitle: '{{title}}',
+        shopName:     {{shopName_json}},
+        productTitle: {{title_json}},
         productId:    '{{productId}}',
         price:        '{{amount}}',
         category:     '{{category}}',
@@ -553,7 +553,7 @@
         body: JSON.stringify({
           recoveryKey,
           productId: '{{productId}}',
-          title: '{{title}}',
+          title: {{title_json}},
           ...(URL_PAYEES && { payees: URL_PAYEES })
         })
       });

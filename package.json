@@ -1,6 +1,6 @@
 {
   "name": "wiki-plugin-shoppe",
-  "version": "0.0.42",
+  "version": "0.0.46",
   "description": "Multi-tenant digital goods shoppe for federated wiki, powered by Sanora",
   "keywords": [
     "wiki",

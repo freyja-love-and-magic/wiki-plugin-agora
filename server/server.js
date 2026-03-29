@@ -8,6 +8,15 @@ const multer = require('multer');
 const FormData = require('form-data');
 const AdmZip = require('adm-zip');
 const sessionless = require('sessionless-node');
+const { secp256k1: _secp256k1 } = require('ethereum-cryptography/secp256k1');
+const { keccak256: _keccak256 } = require('ethereum-cryptography/keccak.js');
+const { utf8ToBytes: _utf8ToBytes } = require('ethereum-cryptography/utils.js');
+
+// Race-safe signing: bypasses the shared sessionless.getKeys singleton.
+function signMessage(message, privateKey) {
+  const hash = _keccak256(_utf8ToBytes(message));
+  return _secp256k1.sign(hash, privateKey).toCompactHex();
+}
 
 // Stripe is used directly for Terminal (card-present) payments.
 // Set STRIPE_SECRET_KEY in the environment. If absent, Terminal endpoints return 503.
@@ -75,8 +84,22 @@ function getSanoraUrl() {
 }
 
 function getAddieUrl() {
-  try { return new URL(getSanoraUrl()).origin + '/plugin/allyabase/addie'; } catch { /* fall through */ }
+  const sanora = getSanoraUrl();
+  try {
+    const url = new URL(sanora);
+    // Only derive from origin when sanora is a wiki proxy URL (has a path component).
+    // A bare host:port URL (e.g. http://localhost:7243) means Addie is on its own port.
+    if (url.pathname && url.pathname !== '/') {
+      return url.origin + '/plugin/allyabase/addie';
+    }
+  } catch { /* fall through */ }
   return `http://localhost:${process.env.ADDIE_PORT || 3005}`;
+}
+
+// Returns the public-facing Sanora URL (via wiki proxy) for browser-visible resource URLs.
+// Always constructed from the current request so it matches the host the browser is using.
+function getSanoraPublicUrl(req) {
+  return `${reqProto(req)}://${req.get('host')}/plugin/allyabase/sanora`;
 }
 
 function getLucilleUrl() {
@@ -111,9 +134,8 @@ async function getOrCreateAffiliateAddieUser(shopperePublicKey) {
   if (affiliates[shopperePublicKey]) return affiliates[shopperePublicKey];
 
   const addieKeys = await sessionless.generateKeys(() => {}, () => null);
-  sessionless.getKeys = () => addieKeys;
   const timestamp = Date.now().toString();
-  const signature = await sessionless.sign(timestamp + addieKeys.pubKey);
+  const signature = signMessage(timestamp + addieKeys.pubKey, addieKeys.privateKey);
 
   const resp = await fetch(`${getAddieUrl()}/user/create`, {
     method: 'PUT',
@@ -142,10 +164,9 @@ async function getOrCreateBuyerAddieUser(recoveryKey, productId) {
   if (buyers[buyerKey]) return buyers[buyerKey];
 
   const addieKeys = await sessionless.generateKeys(() => {}, () => null);
-  sessionless.getKeys = () => addieKeys;
   const timestamp = Date.now().toString();
   const message = timestamp + addieKeys.pubKey;
-  const signature = await sessionless.sign(message);
+  const signature = signMessage(message, addieKeys.privateKey);
 
   const resp = await fetch(`${getAddieUrl()}/user/create`, {
     method: 'PUT',
@@ -183,10 +204,9 @@ async function getOrCreateBuyerAddieUserByPubKey(pubKey, productId) {
   if (buyers[buyerKey]) return buyers[buyerKey];
 
   const addieKeys = await sessionless.generateKeys(() => {}, () => null);
-  sessionless.getKeys = () => addieKeys;
   const timestamp = Date.now().toString();
   const message = timestamp + addieKeys.pubKey;
-  const signature = await sessionless.sign(message);
+  const signature = signMessage(message, addieKeys.privateKey);
 
   const resp = await fetch(`${getAddieUrl()}/user/create`, {
     method: 'PUT',
@@ -208,9 +228,8 @@ async function getOrCreateBuyerAddieUserByPubKey(pubKey, productId) {
 async function hasPurchasedByPubKey(tenant, pubKey, productId) {
   const orderKey = crypto.createHash('sha256').update(pubKey + productId).digest('hex');
   const sanoraUrl = getSanoraUrl();
-  sessionless.getKeys = () => tenant.keys;
   const timestamp = Date.now().toString();
-  const signature = await sessionless.sign(timestamp + tenant.uuid);
+  const signature = signMessage(timestamp + tenant.uuid, tenant.keys.privateKey);
   try {
     const resp = await fetch(
       `${sanoraUrl}/user/${tenant.uuid}/orders/${encodeURIComponent(productId)}` +
@@ -479,10 +498,9 @@ function generateEmojicode(tenants) {
 
 async function addieCreateUser() {
   const addieKeys = await sessionless.generateKeys(() => {}, () => null);
-  sessionless.getKeys = () => addieKeys;
   const timestamp = Date.now().toString();
   const message = timestamp + addieKeys.pubKey;
-  const signature = await sessionless.sign(message);
+  const signature = signMessage(message, addieKeys.privateKey);
 
   const resp = await fetch(`${getAddieUrl()}/user/create`, {
     method: 'PUT',
@@ -501,10 +519,9 @@ async function registerTenant(name) {
 
   // Create a dedicated Sanora user for this tenant
   const keys = await sessionless.generateKeys(() => {}, () => null);
-  sessionless.getKeys = () => keys;
   const timestamp = Date.now().toString();
   const message = timestamp + keys.pubKey;
-  const signature = await sessionless.sign(message);
+  const signature = signMessage(message, keys.privateKey);
 
   const resp = await fetch(`${getSanoraUrl()}/user/create`, {
     method: 'PUT',
@@ -605,8 +622,7 @@ async function sanoraEnsureUser(tenant) {
   const { keys } = tenant;
   const timestamp = Date.now().toString();
   const message = timestamp + keys.pubKey;
-  sessionless.getKeys = () => keys;
-  const signature = await sessionless.sign(message);
+  const signature = signMessage(message, keys.privateKey);
 
   const resp = await fetch(`${getSanoraUrl()}/user/create`, {
     method: 'PUT',
@@ -656,8 +672,7 @@ async function sanoraCreateProduct(tenant, title, category, description, price, 
   const safePrice = price || 0;
   const message = timestamp + uuid + title + (description || '') + safePrice;
 
-  sessionless.getKeys = () => keys;
-  const signature = await sessionless.sign(message);
+  const signature = signMessage(message, keys.privateKey);
 
   const resp = await fetchWithRetry(
     `${getSanoraUrl()}/user/${uuid}/product/${encodeURIComponent(title)}`,
@@ -707,9 +722,8 @@ async function sanoraCreateProductResilient(tenant, title, category, description
 async function sanoraUploadArtifact(tenant, title, fileBuffer, filename, artifactType) {
   const { uuid, keys } = tenant;
   const timestamp = Date.now().toString();
-  sessionless.getKeys = () => keys;
   const message = timestamp + uuid + title;
-  const signature = await sessionless.sign(message);
+  const signature = signMessage(message, keys.privateKey);
 
   const form = new FormData();
   form.append('artifact', fileBuffer, { filename, contentType: getMimeType(filename) });
@@ -741,9 +755,8 @@ async function sanoraUploadArtifact(tenant, title, fileBuffer, filename, artifac
 async function sanoraUploadImage(tenant, title, imageBuffer, filename) {
   const { uuid, keys } = tenant;
   const timestamp = Date.now().toString();
-  sessionless.getKeys = () => keys;
   const message = timestamp + uuid + title;
-  const signature = await sessionless.sign(message);
+  const signature = signMessage(message, keys.privateKey);
 
   const form = new FormData();
   form.append('image', imageBuffer, { filename, contentType: getMimeType(filename) });
@@ -778,8 +791,7 @@ async function sanoraDeleteProduct(tenant, title) {
   const timestamp = Date.now().toString();
   const message = timestamp + uuid + title;
 
-  sessionless.getKeys = () => keys;
-  const signature = await sessionless.sign(message);
+  const signature = signMessage(message, keys.privateKey);
 
   await fetch(
     `${getSanoraUrl()}/user/${uuid}/product/${encodeURIComponent(title)}?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`,
@@ -792,10 +804,9 @@ async function sanoraDeleteProduct(tenant, title) {
 async function lucilleCreateUser(lucilleUrl) {
   const url = lucilleUrl || getLucilleUrl();
   const keys = await sessionless.generateKeys(() => {}, () => null);
-  sessionless.getKeys = () => keys;
   const timestamp = Date.now().toString();
   const message = timestamp + keys.pubKey;
-  const signature = await sessionless.sign(message);
+  const signature = signMessage(message, keys.privateKey);
 
   const resp = await fetch(`${url}/user/create`, {
     method: 'PUT',
@@ -824,8 +835,7 @@ async function lucilleRegisterVideo(tenant, title, description, tags, lucilleUrl
   const { lucilleKeys } = tenant;
   if (!lucilleKeys) throw new Error('Tenant has no Lucille user — re-register to enable video uploads');
   const timestamp = Date.now().toString();
-  sessionless.getKeys = () => lucilleKeys;
-  const signature = await sessionless.sign(timestamp + lucilleKeys.pubKey);
+  const signature = signMessage(timestamp + lucilleKeys.pubKey, lucilleKeys.privateKey);
 
   const resp = await fetch(
     `${url}/user/${lucilleKeys.uuid}/video/${encodeURIComponent(title)}`,
@@ -846,8 +856,7 @@ async function lucilleUploadVideo(tenant, title, fileBuffer, filename, lucilleUr
   const { lucilleKeys } = tenant;
   if (!lucilleKeys) throw new Error('Tenant has no Lucille user');
   const timestamp = Date.now().toString();
-  sessionless.getKeys = () => lucilleKeys;
-  const signature = await sessionless.sign(timestamp + lucilleKeys.pubKey);
+  const signature = signMessage(timestamp + lucilleKeys.pubKey, lucilleKeys.privateKey);
 
   const form = new FormData();
   form.append('video', fileBuffer, { filename, contentType: getMimeType(filename) });
@@ -1506,7 +1515,7 @@ async function processArchive(zipPath, onProgress = () => {}) {
 // PORTFOLIO PAGE GENERATION
 // ============================================================
 
-async function getShoppeGoods(tenant) {
+async function getShoppeGoods(tenant, imageBaseUrl) {
   let products = {};
   try {
     const resp = await fetch(`${getSanoraUrl()}/products/${tenant.uuid}`, { timeout: 15000 });
@@ -1561,7 +1570,7 @@ async function getShoppeGoods(tenant) {
       description: product.description || '',
       price: product.price || 0,
       shipping: product.shipping || 0,
-      image: product.image ? `${getSanoraUrl()}/images/${product.image}` : null,
+      image: product.image ? `${imageBaseUrl || getSanoraUrl()}/images/${product.image}` : null,
       url: resolvedUrl,
       ...(isPost && { category: product.category, tags: product.tags || '' }),
       ...(lucillePlayerUrl && { lucillePlayerUrl }),
@@ -1616,9 +1625,8 @@ async function getAppointmentSchedule(tenant, product) {
 async function getBookedSlots(tenant, productId) {
   const sanoraUrl = getSanoraUrl();
   const tenantKeys = tenant.keys;
-  sessionless.getKeys = () => tenantKeys;
   const timestamp = Date.now().toString();
-  const signature = await sessionless.sign(timestamp + tenant.uuid);
+  const signature = signMessage(timestamp + tenant.uuid, tenantKeys.privateKey);
   const resp = await fetch(
     `${sanoraUrl}/user/${tenant.uuid}/orders/${encodeURIComponent(productId)}?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`
   );
@@ -1695,9 +1703,8 @@ async function getSubscriptionStatus(tenant, productId, recoveryKey) {
   const orderKey  = crypto.createHash('sha256').update(recoveryKey + productId).digest('hex');
   const sanoraUrl = getSanoraUrl();
   const tenantKeys = tenant.keys;
-  sessionless.getKeys = () => tenantKeys;
   const timestamp = Date.now().toString();
-  const signature = await sessionless.sign(timestamp + tenant.uuid);
+  const signature = signMessage(timestamp + tenant.uuid, tenantKeys.privateKey);
   try {
     const resp = await fetch(
       `${sanoraUrl}/user/${tenant.uuid}/orders/${encodeURIComponent(productId)}?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`
@@ -1748,12 +1755,11 @@ async function getAllOrders(tenant) {
     console.warn(`[shoppe] getAllOrders: Sanora unreachable — ${err.message}`);
   }
 
-  sessionless.getKeys = () => tenant.keys;
 
   const results = [];
   for (const [title, product] of Object.entries(products)) {
     const timestamp = Date.now().toString();
-    const signature = await sessionless.sign(timestamp + tenant.uuid);
+    const signature = signMessage(timestamp + tenant.uuid, tenant.keys.privateKey);
     try {
       const resp = await fetch(
         `${sanoraUrl}/user/${tenant.uuid}/orders/${encodeURIComponent(product.productId)}` +
@@ -3215,7 +3221,7 @@ async function startServer(params) {
       const product = products[title] || Object.values(products).find(p => p.title === title);
       if (!product) return res.status(404).send('<h1>Product not found</h1>');
 
-      const imageUrl = product.image ? `${sanoraUrlInternal}/images/${product.image}` : '';
+      const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
       const ebookUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}/download/${encodeURIComponent(title)}`;
       const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
       const payees = tenant.addieKeys
@@ -3251,6 +3257,8 @@ async function startServer(params) {
         tenantUuid:      tenant.uuid,
         keywords:        extractKeywords(product),
         shopName:        tenant.name || '',
+        shopName_json:   JSON.stringify(tenant.name || ''),
+        title_json:      JSON.stringify(product.title || title),
         category:        product.category || 'book',
       });
 
@@ -3286,7 +3294,7 @@ async function startServer(params) {
       const schedule = await getAppointmentSchedule(tenant, product);
       const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
       const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
-      const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
+      const imageUrl = product.image ? `${getSanoraPublicUrl(req)}/images/${product.image}` : '';
 
       const price = product.price || 0;
       const html = fillTemplate(APPOINTMENT_BOOKING_TMPL, {
@@ -3301,7 +3309,8 @@ async function startServer(params) {
         proceedLabel:    price === 0 ? 'Confirm Booking →' : 'Continue to Payment →',
         shoppeUrl,
         tenantUuid:      tenant.uuid,
-        keywords:        extractKeywords(product)
+        keywords:        extractKeywords(product),
+        title_json:      JSON.stringify(product.title || title),
       });
 
       res.set('Content-Type', 'text/html');
@@ -3354,7 +3363,7 @@ async function startServer(params) {
       const tierInfo = await getTierInfo(tenant, product);
       const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
       const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
-      const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
+      const imageUrl = product.image ? `${getSanoraPublicUrl(req)}/images/${product.image}` : '';
       const benefits = tierInfo && tierInfo.benefits
         ? tierInfo.benefits.map(b => `<li>${escHtml(b)}</li>`).join('')
         : '';
@@ -3370,7 +3379,8 @@ async function startServer(params) {
         renewalDays:     String(tierInfo ? (tierInfo.renewalDays || 30) : 30),
         shoppeUrl,
         tenantUuid:      tenant.uuid,
-        keywords:        extractKeywords(product)
+        keywords:        extractKeywords(product),
+        title_json:      JSON.stringify(product.title || title),
       });
 
       res.set('Content-Type', 'text/html');
@@ -3426,10 +3436,9 @@ async function startServer(params) {
       }
 
       const addieKeys = { pubKey: tenant.addieKeys.pubKey, privateKey: tenant.addieKeys.privateKey };
-      sessionless.getKeys = () => addieKeys;
       const timestamp = Date.now().toString();
       const message   = timestamp + tenant.addieKeys.uuid;
-      const signature = await sessionless.sign(message);
+      const signature = signMessage(message, addieKeys.privateKey);
 
       const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
       const returnUrl  = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}/payouts/return`;
@@ -3536,7 +3545,7 @@ async function startServer(params) {
           productId:          product.productId,
           description:        product.description || '',
           price:              product.price || 0,
-          image:              product.image ? `${sanoraUrl}/images/${product.image}` : null,
+          image:              product.image ? `${getSanoraPublicUrl(req)}/images/${product.image}` : null,
           benefits:           tierInfo ? (tierInfo.benefits || []) : [],
           renewalDays:        tierInfo ? (tierInfo.renewalDays || 30) : 30,
           active:             status.active,
@@ -3673,9 +3682,8 @@ async function startServer(params) {
           : tenant.addieKeys ? [{ pubKey: tenant.addieKeys.pubKey, amount }] : [];
       }
       const buyerKeys = { pubKey: buyer.pubKey, privateKey: buyer.privateKey };
-      sessionless.getKeys = () => buyerKeys;
       const intentTimestamp = Date.now().toString();
-      const intentSignature = await sessionless.sign(intentTimestamp + buyer.uuid + amount + 'USD');
+      const intentSignature = signMessage(intentTimestamp + buyer.uuid + amount + 'USD', buyerKeys.privateKey);
       const intentResp = await fetch(`${getAddieUrl()}/user/${buyer.uuid}/processor/stripe/intent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3728,9 +3736,8 @@ async function startServer(params) {
         // Shoppere subscription: orderKey = sha256(pubKey + productId)
         const orderKey = crypto.createHash('sha256').update(pubKey + productId).digest('hex');
         const tenantKeys = tenant.keys;
-        sessionless.getKeys = () => tenantKeys;
         const ts  = Date.now().toString();
-        const sig = await sessionless.sign(ts + tenant.uuid);
+        const sig = signMessage(ts + tenant.uuid, tenantKeys.privateKey);
         const order = { orderKey, pubKey, paidAt: Date.now(), title, productId, renewalDays: renewalDays || 30, status: 'active' };
         await fetch(`${sanoraUrlInternal}/user/${tenant.uuid}/orders`, {
           method: 'PUT',
@@ -3745,9 +3752,8 @@ async function startServer(params) {
         // Shoppere appointment: record booking with pubKey credential
         const orderKey = crypto.createHash('sha256').update(pubKey + productId).digest('hex');
         const tenantKeys = tenant.keys;
-        sessionless.getKeys = () => tenantKeys;
         const bookingTimestamp = Date.now().toString();
-        const bookingSignature = await sessionless.sign(bookingTimestamp + tenant.uuid);
+        const bookingSignature = signMessage(bookingTimestamp + tenant.uuid, tenantKeys.privateKey);
         const order = {
           orderKey,
           pubKey,
@@ -3770,9 +3776,8 @@ async function startServer(params) {
         // Shoppere digital product: record purchase with pubKey as credential
         const orderKey = crypto.createHash('sha256').update(pubKey + productId).digest('hex');
         const tenantKeys = tenant.keys;
-        sessionless.getKeys = () => tenantKeys;
         const ts  = Date.now().toString();
-        const sig = await sessionless.sign(ts + tenant.uuid);
+        const sig = signMessage(ts + tenant.uuid, tenantKeys.privateKey);
         const order = { orderKey, pubKey, paidAt: Date.now(), title, productId, status: 'purchased' };
         await fetch(`${sanoraUrlInternal}/user/${tenant.uuid}/orders`, {
           method: 'PUT',
@@ -3798,9 +3803,8 @@ async function startServer(params) {
         // The recovery key itself is never stored; orderKey = sha256(recoveryKey + productId).
         const orderKey = crypto.createHash('sha256').update(recoveryKey + productId).digest('hex');
         const tenantKeys = tenant.keys;
-        sessionless.getKeys = () => tenantKeys;
         const ts  = Date.now().toString();
-        const sig = await sessionless.sign(ts + tenant.uuid);
+        const sig = signMessage(ts + tenant.uuid, tenantKeys.privateKey);
         const order = { orderKey, paidAt: Date.now(), title, productId, renewalDays: renewalDays || 30, status: 'active' };
         await fetch(`${sanoraUrlInternal}/user/${tenant.uuid}/orders`, {
           method: 'PUT',
@@ -3819,9 +3823,8 @@ async function startServer(params) {
 
         // Record the booking in Sanora (contact info flows through the server, never direct from browser)
         const tenantKeys = tenant.keys;
-        sessionless.getKeys = () => tenantKeys;
         const bookingTimestamp = Date.now().toString();
-        const bookingSignature = await sessionless.sign(bookingTimestamp + tenant.uuid);
+        const bookingSignature = signMessage(bookingTimestamp + tenant.uuid, tenantKeys.privateKey);
         const order = {
           productId,
           title,
@@ -3851,9 +3854,8 @@ async function startServer(params) {
         // Physical product — record order in Sanora signed by the tenant.
         // The shippingAddress is collected here (post-payment) and sent once, server-side.
         const tenantKeys = tenant.keys;
-        sessionless.getKeys = () => tenantKeys;
         const orderTimestamp = Date.now().toString();
-        const orderSignature = await sessionless.sign(orderTimestamp + tenant.uuid);
+        const orderSignature = signMessage(orderTimestamp + tenant.uuid, tenantKeys.privateKey);
         const order = {
           productId,
           title,
@@ -3972,8 +3974,7 @@ async function startServer(params) {
       // Record order in Sanora (fire-and-forget)
       if (productId && tenant.keys) {
         const ts = Date.now().toString();
-        sessionless.getKeys = () => tenant.keys;
-        const orderSig = await sessionless.sign(ts + tenant.uuid).catch(() => null);
+        const orderSig = signMessage(ts + tenant.uuid).catch(() => null, tenant.keys.privateKey);
         if (orderSig) {
           const order = {
             productId,
@@ -4053,14 +4054,15 @@ async function startServer(params) {
         if (!purchased) return res.status(403).send('<h1>No purchase found for this key</h1>');
       }
 
-      const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
+      const sanoraPublicUrl = getSanoraPublicUrl(req);
+      const imageUrl = product.image ? `${sanoraPublicUrl}/images/${product.image}` : '';
 
       // Map artifact UUIDs to download paths by extension
       let epubPath = '', pdfPath = '', mobiPath = '';
       (product.artifacts || []).forEach(artifact => {
-        if (artifact.includes('epub')) epubPath = `${sanoraUrl}/artifacts/${artifact}`;
-        if (artifact.includes('pdf'))  pdfPath  = `${sanoraUrl}/artifacts/${artifact}`;
-        if (artifact.includes('mobi')) mobiPath = `${sanoraUrl}/artifacts/${artifact}`;
+        if (artifact.includes('epub')) epubPath = `${sanoraPublicUrl}/artifacts/${artifact}`;
+        if (artifact.includes('pdf'))  pdfPath  = `${sanoraPublicUrl}/artifacts/${artifact}`;
+        if (artifact.includes('mobi')) mobiPath = `${sanoraPublicUrl}/artifacts/${artifact}`;
       });
 
       const html = fillTemplate(EBOOK_DOWNLOAD_TMPL, {
@@ -4106,7 +4108,7 @@ async function startServer(params) {
       const fm = parseFrontMatter(mdContent);
       const postTitle = fm.title || title;
       const postDate  = fm.date || '';
-      const imageUrl  = product.image ? `${getSanoraUrl()}/images/${product.image}` : null;
+      const imageUrl  = product.image ? `${getSanoraPublicUrl(req)}/images/${product.image}` : null;
 
       res.set('Content-Type', 'text/html');
       res.send(generatePostHTML(tenant, postTitle, postDate, imageUrl, fm.body || mdContent));
@@ -4135,8 +4137,7 @@ async function startServer(params) {
       const { uuid: lucilleUuid, pubKey, privateKey } = tenant.lucilleKeys;
 
       const timestamp = Date.now().toString();
-      sessionless.getKeys = () => ({ pubKey, privateKey });
-      const signature = await sessionless.sign(timestamp + pubKey);
+      const signature = signMessage(timestamp + pubKey, privateKey);
 
       const uploadUrl = `${lucilleBase}/user/${lucilleUuid}/video/${encodeURIComponent(title)}/file`;
       res.json({ uploadUrl, timestamp, signature });
@@ -4182,7 +4183,7 @@ async function startServer(params) {
               productId:    product.productId,
               title:        product.title,
               category:     product.category,
-              image:        product.image ? `${sanoraUrl}/images/${product.image}` : null,
+              image:        product.image ? `${getSanoraPublicUrl(req)}/images/${product.image}` : null,
               price:        product.price,
               paidAt:       match.paidAt,
               status:       match.status,
@@ -4208,7 +4209,7 @@ async function startServer(params) {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
-      const goods = await getShoppeGoods(tenant);
+      const goods = await getShoppeGoods(tenant, getSanoraPublicUrl(req));
       const cat = req.query.category;
       res.json({ success: true, goods: (cat && goods[cat]) ? goods[cat] : goods });
     } catch (err) {
@@ -4230,7 +4231,7 @@ async function startServer(params) {
       const tracks = [];
       for (const [key, product] of Object.entries(products)) {
         if (product.category !== 'music') continue;
-        const cover = product.image ? `${sanoraUrl}/images/${product.image}` : null;
+        const cover = product.image ? `${getSanoraPublicUrl(req)}/images/${product.image}` : null;
         const artifacts = product.artifacts || [];
         if (artifacts.length > 1) {
           albums.push({
@@ -4264,7 +4265,7 @@ async function startServer(params) {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
-      const goods = await getShoppeGoods(tenant);
+      const goods = await getShoppeGoods(tenant, getSanoraPublicUrl(req));
 
       // Check if the request carries a valid owner signature — if so, embed auth
       // params in the page so the upload button can authenticate with upload-info.

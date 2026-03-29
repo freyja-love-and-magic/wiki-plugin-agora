@@ -2,7 +2,7 @@
 
 Multi-tenant digital goods shoppe for Federated Wiki, powered by Sanora.
 
-**Current version**: 0.0.35
+**Current version**: 0.0.43
 
 ## Architecture
 

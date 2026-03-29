@@ -506,7 +506,7 @@
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           productId: '{{productId}}',
-          title: '{{title}}',
+          title: {{title_json}},
           ...(URL_PAYEES && { payees: URL_PAYEES })
         })
       });
@@ -548,7 +548,7 @@
         body: JSON.stringify({
           orderRef,
           productId: '{{productId}}',
-          title: '{{title}}',
+          title: {{title_json}},
           amount: {{amount}},
           address: window.pendingAddress,
           paymentIntentId
