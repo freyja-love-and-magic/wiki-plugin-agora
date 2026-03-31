@@ -497,11 +497,11 @@
   const errorMessage = document.getElementById('error-message');
   const loadingMessage = document.getElementById('loading');
 
-  // Request a Stripe payment intent from the shoppe server.
+  // Request a Stripe payment intent from the agora server.
   // Address is held in memory here and only sent to the server after payment succeeds.
   async function requestPaymentIntent(address) {
     try {
-      const res = await fetch('{{shoppeUrl}}/purchase/intent', {
+      const res = await fetch('{{agoraUrl}}/purchase/intent', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -528,13 +528,13 @@
     }
   }
 
-  // Called after Stripe confirms payment. Sends address to the shoppe server which
+  // Called after Stripe confirms payment. Sends address to the agora server which
   // records the order in Sanora — address never goes directly from browser to Sanora.
   window.confirmPayment = async () => {
     try {
       const { error } = await stripe.confirmPayment({
         elements,
-        confirmParams: { return_url: '{{shoppeUrl}}' },
+        confirmParams: { return_url: '{{agoraUrl}}' },
         redirect: 'if_required'
       });
 
@@ -542,7 +542,7 @@
 
       // Payment succeeded — now record the order server-side with the shipping address
       const paymentIntentId = window.clientSecret ? window.clientSecret.split('_secret_')[0] : undefined;
-      await fetch('{{shoppeUrl}}/purchase/complete', {
+      await fetch('{{agoraUrl}}/purchase/complete', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -555,7 +555,7 @@
         })
       });
 
-      window.location.href = '{{shoppeUrl}}';
+      window.location.href = '{{agoraUrl}}';
     } catch(err) {
       showError('An unexpected error occurred.');
       console.warn('payment error: ', err);

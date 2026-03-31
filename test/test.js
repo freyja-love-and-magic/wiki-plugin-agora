@@ -1,12 +1,12 @@
 'use strict';
 
 // ── Set up a temp HOME before the server module loads, so DATA_DIR
-//   (~/.shoppe) is isolated from any real shoppe data on this machine.
+//   (~/.agora) is isolated from any real agora data on this machine.
 const path   = require('path');
 const os     = require('os');
 const fs     = require('fs');
 
-const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'shoppe-test-'));
+const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'agora-test-'));
 process.env.HOME = TEST_HOME;
 
 // ── Dependencies ─────────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ function buildTestArchive(uuid, emojicode) {
   const zip = new AdmZip();
 
   zip.addFile('manifest.json', Buffer.from(JSON.stringify({
-    uuid, emojicode, name: 'Integration Test Shoppe'
+    uuid, emojicode, name: 'Integration Test Agora'
   })));
 
   // book
@@ -121,7 +121,7 @@ function buildTestArchive(uuid, emojicode) {
 before(async function() {
   // If SANORA_URL env var is set, write it to config before server starts
   if (process.env.SANORA_URL) {
-    const cfgDir = path.join(TEST_HOME, '.shoppe');
+    const cfgDir = path.join(TEST_HOME, '.agora');
     fs.mkdirSync(cfgDir, { recursive: true });
     fs.writeFileSync(path.join(cfgDir, 'config.json'),
       JSON.stringify({ sanoraUrl: process.env.SANORA_URL }));
@@ -154,21 +154,21 @@ after(done => {
 async function uploadArchive(zipBuffer) {
   const form = new FormData();
   form.append('archive', zipBuffer, { filename: 'test.zip', contentType: 'application/zip' });
-  return fetch(`${BASE_URL}/plugin/shoppe/upload`, {
+  return fetch(`${BASE_URL}/plugin/agora/upload`, {
     method: 'POST', body: form, headers: form.getHeaders()
   });
 }
 
 // ── Always-on tests (no Sanora needed) ───────────────────────────────────────
 
-it('should return 404 for an unknown shoppe identifier', async () => {
-  const resp = await fetch(`${BASE_URL}/plugin/shoppe/00000000-0000-0000-0000-000000000000`);
+it('should return 404 for an unknown agora identifier', async () => {
+  const resp = await fetch(`${BASE_URL}/plugin/agora/00000000-0000-0000-0000-000000000000`);
   resp.status.should.equal(404);
 });
 
 it('should reject an archive whose manifest uuid/emojicode are missing', async () => {
   const zip = new AdmZip();
-  zip.addFile('manifest.json', Buffer.from(JSON.stringify({ name: 'No UUID Shoppe' })));
+  zip.addFile('manifest.json', Buffer.from(JSON.stringify({ name: 'No UUID Agora' })));
   const resp = await uploadArchive(zip.toBuffer());
   const data = await resp.json();
   data.success.should.equal(false);
@@ -180,7 +180,7 @@ it('should reject an archive whose uuid does not match any registered tenant', a
   zip.addFile('manifest.json', Buffer.from(JSON.stringify({
     uuid: '00000000-0000-0000-0000-000000000000',
     emojicode: '🛍️🎨🎁🌟💎🐉📚🔥',
-    name: 'Ghost Shoppe'
+    name: 'Ghost Agora'
   })));
   const resp = await uploadArchive(zip.toBuffer());
   const data = await resp.json();
@@ -234,10 +234,10 @@ describe('Sanora integration', function() {
   });
 
   it('should register a new tenant', async () => {
-    const resp = await fetch(`${BASE_URL}/plugin/shoppe/register`, {
+    const resp = await fetch(`${BASE_URL}/plugin/agora/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Test Shoppe' })
+      body: JSON.stringify({ name: 'Test Agora' })
     });
     const data = await resp.json();
     if (!data.success) console.error('    error:', data.error);
@@ -250,12 +250,12 @@ describe('Sanora integration', function() {
   });
 
   it('should list tenants including the new one', async () => {
-    const resp = await fetch(`${BASE_URL}/plugin/shoppe/tenants`);
+    const resp = await fetch(`${BASE_URL}/plugin/agora/tenants`);
     const data = await resp.json();
     data.success.should.equal(true);
     const found = data.tenants.find(t => t.uuid === tenant.uuid);
     found.should.exist;
-    found.name.should.equal('Test Shoppe');
+    found.name.should.equal('Test Agora');
   });
 
   it('should upload an archive with all content categories', async () => {
@@ -277,7 +277,7 @@ describe('Sanora integration', function() {
   });
 
   it('should return all goods categories from the goods endpoint', async () => {
-    const resp = await fetch(`${BASE_URL}/plugin/shoppe/${tenant.uuid}/goods`);
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/goods`);
     const data = await resp.json();
     data.success.should.equal(true);
     data.goods.books.length.should.be.at.least(1,         'missing books');
@@ -289,17 +289,17 @@ describe('Sanora integration', function() {
     data.goods.subscriptions.length.should.be.at.least(1, 'missing subscriptions');
   });
 
-  it('should serve the shoppe HTML page with all tabs', async () => {
-    const resp = await fetch(`${BASE_URL}/plugin/shoppe/${tenant.uuid}`);
+  it('should serve the agora HTML page with all tabs', async () => {
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}`);
     resp.status.should.equal(200);
     const html = await resp.text();
-    html.should.include('Test Shoppe');
+    html.should.include('Test Agora');
     html.should.include('class="tab"');
     html.should.include('membership');
   });
 
   it('should return appointment slots for the uploaded session', async () => {
-    const resp = await fetch(`${BASE_URL}/plugin/shoppe/${tenant.uuid}/book/Test%20Session/slots`);
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/book/Test%20Session/slots`);
     const data = await resp.json();
     data.available.should.be.an('array');
     data.available.length.should.be.at.least(1, 'expected at least one day with slots in the next 14 days');
@@ -309,7 +309,7 @@ describe('Sanora integration', function() {
   });
 
   it('should serve the appointment booking page', async () => {
-    const resp = await fetch(`${BASE_URL}/plugin/shoppe/${tenant.uuid}/book/Test%20Session`);
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/book/Test%20Session`);
     resp.status.should.equal(200);
     const html = await resp.text();
     html.should.include('Test Session');
@@ -319,7 +319,7 @@ describe('Sanora integration', function() {
   });
 
   it('should serve the subscription sign-up page with benefits', async () => {
-    const resp = await fetch(`${BASE_URL}/plugin/shoppe/${tenant.uuid}/subscribe/Bronze%20Tier`);
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/subscribe/Bronze%20Tier`);
     resp.status.should.equal(200);
     const html = await resp.text();
     html.should.include('Bronze Tier');
@@ -328,7 +328,7 @@ describe('Sanora integration', function() {
   });
 
   it('should serve the membership portal page', async () => {
-    const resp = await fetch(`${BASE_URL}/plugin/shoppe/${tenant.uuid}/membership`);
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/membership`);
     resp.status.should.equal(200);
     const html = await resp.text();
     html.should.include('membership/check');
@@ -336,7 +336,7 @@ describe('Sanora integration', function() {
   });
 
   it('should report no active subscriptions for an unknown recovery key', async () => {
-    const resp = await fetch(`${BASE_URL}/plugin/shoppe/${tenant.uuid}/membership/check`, {
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/membership/check`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ recoveryKey: 'no-such-key-xyz-99' })
@@ -357,9 +357,9 @@ const describeStripe = (STRIPE_TEST_KEY && sanoraAvailable) ? describe : describ
 
 describeStripe('Stripe purchase flow (requires STRIPE_TEST_KEY + Sanora)', function() {
   it('should create a Stripe payment intent for a subscription', async () => {
-    const goods = await (await fetch(`${BASE_URL}/plugin/shoppe/${tenant.uuid}/goods`)).json();
+    const goods = await (await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/goods`)).json();
     const sub = goods.goods.subscriptions[0];
-    const resp = await fetch(`${BASE_URL}/plugin/shoppe/${tenant.uuid}/purchase/intent`, {
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/purchase/intent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

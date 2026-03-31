@@ -30,7 +30,7 @@ function getStripe() {
   return _stripe;
 }
 
-const SHOPPE_BASE_EMOJI = process.env.SHOPPE_BASE_EMOJI || '🛍️🎨🎁';
+const AGORA_BASE_EMOJI = process.env.AGORA_BASE_EMOJI || '🛍️🎨🎁';
 
 const TEMPLATES_DIR = path.join(__dirname, 'templates');
 const RECOVER_STRIPE_TMPL      = fs.readFileSync(path.join(TEMPLATES_DIR, 'generic-recover-stripe.html'), 'utf8');
@@ -48,7 +48,7 @@ function fillTemplate(tmpl, vars) {
     html.replace(new RegExp(`\\{\\{${k}\\}\\}`, 'g'), v), tmpl);
 }
 
-const DATA_DIR     = path.join(process.env.HOME || '/root', '.shoppe');
+const DATA_DIR     = path.join(process.env.HOME || '/root', '.agora');
 const TENANTS_FILE = path.join(DATA_DIR, 'tenants.json');
 const BUYERS_FILE  = path.join(DATA_DIR, 'buyers.json');
 const CONFIG_FILE  = path.join(DATA_DIR, 'config.json');
@@ -56,7 +56,23 @@ const CONFIG_FILE  = path.join(DATA_DIR, 'config.json');
 // This file contains PII (name, address). Purge individual records once orders ship.
 const ORDERS_FILE     = path.join(DATA_DIR, 'orders.json');
 const AFFILIATES_FILE = path.join(DATA_DIR, 'affiliates.json');
-const TMP_DIR      = '/tmp/shoppe-uploads';
+const TMP_DIR      = '/tmp/agora-uploads';
+
+// One-time migration: copy ~/.shoppe/ → ~/.agora/ if the old directory exists and new one doesn't.
+(function migrateShoppeToAgora() {
+  const oldDir = path.join(process.env.HOME || '/root', '.shoppe');
+  if (fs.existsSync(oldDir) && !fs.existsSync(DATA_DIR)) {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      for (const file of fs.readdirSync(oldDir)) {
+        fs.copyFileSync(path.join(oldDir, file), path.join(DATA_DIR, file));
+      }
+      console.log('[agora] Migrated data from ~/.shoppe to ~/.agora');
+    } catch (err) {
+      console.warn('[agora] Migration from ~/.shoppe failed:', err.message);
+    }
+  }
+})();
 
 // ============================================================
 // CONFIG (allyabase URL, etc.)
@@ -96,9 +112,16 @@ function getAddieUrl() {
   return `http://localhost:${process.env.ADDIE_PORT || 3005}`;
 }
 
-// Returns the public-facing Sanora URL (via wiki proxy) for browser-visible resource URLs.
-// Always constructed from the current request so it matches the host the browser is using.
+// Returns the public-facing Sanora URL for browser-visible resource URLs (images, artifacts).
+// When sanora is configured as a full proxy URL (e.g. https://dev.allyabase.com/plugin/allyabase/sanora),
+// use it directly — it's already publicly accessible.
+// When sanora is a bare host:port (e.g. http://localhost:7243), route through the wiki proxy instead.
 function getSanoraPublicUrl(req) {
+  const sanora = getSanoraUrl();
+  try {
+    const url = new URL(sanora);
+    if (url.pathname && url.pathname !== '/') return sanora;
+  } catch {}
   return `${reqProto(req)}://${req.get('host')}/plugin/allyabase/sanora`;
 }
 
@@ -126,12 +149,12 @@ function saveAffiliates(affiliates) {
   fs.writeFileSync(AFFILIATES_FILE, JSON.stringify(affiliates, null, 2));
 }
 
-// Get or create an Addie user representing an affiliate (Shoppere user who initiates NFC charges).
-// Keyed by the affiliate's Shoppere pubKey. The affiliate's Addie account receives their cut of
+// Get or create an Addie user representing an affiliate (Polites user who initiates NFC charges).
+// Keyed by the affiliate's Polites pubKey. The affiliate's Addie account receives their cut of
 // split payments. Stripe Connect onboarding is a separate step handled outside this function.
-async function getOrCreateAffiliateAddieUser(shopperePublicKey) {
+async function getOrCreateAffiliateAddieUser(politesPublicKey) {
   const affiliates = loadAffiliates();
-  if (affiliates[shopperePublicKey]) return affiliates[shopperePublicKey];
+  if (affiliates[politesPublicKey]) return affiliates[politesPublicKey];
 
   const addieKeys = await sessionless.generateKeys(() => {}, () => null);
   const timestamp = Date.now().toString();
@@ -150,9 +173,9 @@ async function getOrCreateAffiliateAddieUser(shopperePublicKey) {
     uuid: addieUser.uuid,
     pubKey: addieKeys.pubKey,
     privateKey: addieKeys.privateKey,
-    shoppereKey: shopperePublicKey
+    politesKey: politesPublicKey
   };
-  affiliates[shopperePublicKey] = entry;
+  affiliates[politesPublicKey] = entry;
   saveAffiliates(affiliates);
   return entry;
 }
@@ -183,9 +206,9 @@ async function getOrCreateBuyerAddieUser(recoveryKey, productId) {
   return buyer;
 }
 
-// ── Shoppere app: pubKey-based buyer auth ────────────────────────────────────
+// ── Polites app: pubKey-based buyer auth ─────────────────────────────────────
 
-// Verify a buyer-signed request from the Shoppere app.
+// Verify a buyer-signed request from the Polites app.
 // Message convention: timestamp + pubKey  (mirrors Sessionless ecosystem standard)
 // Returns an error string on failure, null on success.
 function verifyBuyerSignature(pubKey, timestamp, signature, maxAgeMs = 5 * 60 * 1000) {
@@ -221,6 +244,35 @@ async function getOrCreateBuyerAddieUserByPubKey(pubKey, productId) {
   buyers[buyerKey] = buyer;
   saveBuyers(buyers);
   return buyer;
+}
+
+// ── Server Addie user (for platform commission) ──────────────────────────────
+
+// Create or load the server's own Addie user.
+// Stored in ~/.agora/config.json under "serverAddie".
+// Used to receive a platform commission on all tenant purchases.
+async function ensureServerAddieUser() {
+  const config = loadConfig();
+  if (config.serverAddie && config.serverAddie.uuid) return config.serverAddie;
+
+  const addieKeys = await sessionless.generateKeys(() => {}, () => null);
+  const timestamp = Date.now().toString();
+  const message = timestamp + addieKeys.pubKey;
+  const signature = signMessage(message, addieKeys.privateKey);
+
+  const resp = await fetch(`${getAddieUrl()}/user/create`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ timestamp, pubKey: addieKeys.pubKey, signature })
+  });
+
+  const addieUser = await resp.json();
+  if (addieUser.error) throw new Error(`Addie: ${addieUser.error}`);
+
+  const serverAddie = { uuid: addieUser.uuid, pubKey: addieKeys.pubKey, privateKey: addieKeys.privateKey };
+  config.serverAddie = serverAddie;
+  saveConfig(config);
+  return serverAddie;
 }
 
 // Check whether a pubKey has a completed purchase for a productId by looking
@@ -300,6 +352,93 @@ function buildTags(baseTags, keywords) {
   return baseTags + ',' + kwTags.join(',');
 }
 
+// ── FedWiki catalog page (SEO) ──────────────────────────────────────────────
+// After each successful archive upload we write/overwrite a FedWiki page whose
+// story paragraphs contain every product title, description, and keyword.
+// FedWiki's federation search indexes all paragraph text, so this makes the
+// agora's inventory discoverable from any wiki on the federation.
+
+function getWikiPagesDir(req) {
+  const wikiRoot = path.join(process.env.HOME || '/root', '.wiki');
+  // Multi-domain setup: ~/.wiki/{domain}/pages/
+  const domain = req.get('host').replace(/:\d+$/, '');
+  const domainDir = path.join(wikiRoot, domain, 'pages');
+  if (fs.existsSync(domainDir)) return domainDir;
+  // Single-domain default: ~/.wiki/pages/
+  const defaultDir = path.join(wikiRoot, 'pages');
+  if (fs.existsSync(defaultDir)) return defaultDir;
+  return null;
+}
+
+async function writeAgoraWikiPage(req, tenantInfo, wikiOrigin) {
+  const pagesDir = getWikiPagesDir(req);
+  if (!pagesDir) {
+    console.warn('[agora] Wiki pages directory not found — skipping catalog page');
+    return;
+  }
+
+  // Fetch full product metadata (titles, descriptions, keywords) from Sanora
+  const resp = await fetch(`${getSanoraUrl()}/products/${tenantInfo.uuid}`, { timeout: 10000 });
+  if (!resp.ok) return;
+  const products = await resp.json();
+
+  const pageTitle = tenantInfo.name || 'Agora';
+  // FedWiki slugs: lowercase, spaces → hyphens, strip everything else
+  const slug = pageTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+
+  const now = Date.now();
+  const story = [];
+  const allKeywords = new Set();
+
+  // Count items by category for the intro line
+  const catCount = {};
+  for (const p of Object.values(products)) {
+    if (p.category) catCount[p.category] = (catCount[p.category] || 0) + 1;
+  }
+  const categoryLine = Object.entries(catCount)
+    .map(([c, n]) => `${n} ${c}${n !== 1 ? 's' : ''}`)
+    .join(', ');
+
+  story.push({
+    type: 'paragraph',
+    id: crypto.randomBytes(8).toString('hex'),
+    text: `${pageTitle} — digital goods shop featuring ${categoryLine || 'products'}. ${wikiOrigin}/plugin/agora/${tenantInfo.uuid}`
+  });
+
+  // One paragraph per product: title, description, keywords
+  for (const product of Object.values(products)) {
+    const kws = extractKeywords(product);
+    if (kws) kws.split(', ').forEach(k => allKeywords.add(k.trim()));
+
+    const desc = product.description ? ` — ${product.description}` : '';
+    const kwStr = kws ? ` Keywords: ${kws}.` : '';
+    story.push({
+      type: 'paragraph',
+      id: crypto.randomBytes(8).toString('hex'),
+      text: `${product.title || '(untitled)'}${desc}${kwStr}`
+    });
+  }
+
+  // Aggregate tags paragraph so all keywords appear as a searchable block
+  if (allKeywords.size > 0) {
+    story.push({
+      type: 'paragraph',
+      id: crypto.randomBytes(8).toString('hex'),
+      text: `Tags: ${[...allKeywords].join(', ')}`
+    });
+  }
+
+  const page = {
+    title: pageTitle,
+    story,
+    journal: [{ type: 'create', item: { title: pageTitle, story: [] }, date: now }]
+  };
+
+  const pageFile = path.join(pagesDir, slug);
+  fs.writeFileSync(pageFile, JSON.stringify(page));
+  console.log(`[agora] Wiki catalog page written: ~/.wiki/…/pages/${slug} (${story.length - 1} products)`);
+}
+
 // ── Owner key pair (secp256k1 via sessionless) ───────────────────────────────
 
 async function generateOwnerKeyPair() {
@@ -315,15 +454,15 @@ function validateOwnerSignature(manifest, tenant) {
   if (!manifest.ownerPubKey || !manifest.timestamp || !manifest.signature) {
     throw new Error(
       'Archive is missing owner signature fields. Sign it first:\n' +
-      '  node shoppe-sign.js'
+      '  node agora-sign.js'
     );
   }
   if (manifest.ownerPubKey !== tenant.ownerPubKey) {
-    throw new Error('Owner public key does not match the registered key for this shoppe');
+    throw new Error('Owner public key does not match the registered key for this agora');
   }
   const age = Date.now() - parseInt(manifest.timestamp, 10);
   if (isNaN(age) || age < 0 || age > 10 * 60 * 1000) {
-    throw new Error('Signature timestamp is invalid or expired — re-run: node shoppe-sign.js');
+    throw new Error('Signature timestamp is invalid or expired — re-run: node agora-sign.js');
   }
   const message = manifest.timestamp + manifest.uuid;
   if (!sessionless.verifySignature(manifest.signature, message, manifest.ownerPubKey)) {
@@ -337,37 +476,37 @@ const bundleTokens = new Map();
 // Build the starter bundle zip for a newly registered tenant.
 function generateBundleBuffer(tenant, ownerPrivateKey, ownerPubKey, wikiOrigin) {
   const SIGN_SCRIPT = fs.readFileSync(
-    path.join(__dirname, 'scripts', 'shoppe-sign.js')
+    path.join(__dirname, 'scripts', 'agora-sign.js')
   );
 
   const manifest = {
     uuid:     tenant.uuid,
     emojicode: tenant.emojicode,
     name:     tenant.name,
-    wikiUrl:  `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`
+    wikiUrl:  `${wikiOrigin}/plugin/agora/${tenant.uuid}`
   };
 
   const keyData = { privateKey: ownerPrivateKey, pubKey: ownerPubKey };
 
   const packageJson = JSON.stringify({
-    name: 'shoppe',
+    name: 'agora',
     version: '1.0.0',
     private: true,
-    description: 'Shoppe content folder',
+    description: 'Agora content folder',
     dependencies: {
       'sessionless-node': 'latest'
     }
   }, null, 2);
 
   const readme = [
-    `# ${tenant.name} — Shoppe Starter`,
+    `# ${tenant.name} — Agora Starter`,
     '',
     '## First-time setup',
     '',
     '1. Install Node.js if needed: https://nodejs.org',
     '2. Run: `npm install`  (installs sessionless-node — one time only)',
-    '3. Run: `node shoppe-sign.js init`',
-    '   This moves your private key to ~/.shoppe/keys/ and removes it from this folder.',
+    '3. Run: `node agora-sign.js init`',
+    '   This moves your private key to ~/.agora/keys/ and removes it from this folder.',
     '',
     '## Adding content',
     '',
@@ -387,32 +526,32 @@ function generateBundleBuffer(tenant, ownerPrivateKey, ownerPubKey, wikiOrigin) 
     '',
     '## Uploading',
     '',
-    'Run: `node shoppe-sign.js`',
+    'Run: `node agora-sign.js`',
     '',
     'This signs your manifest and creates a ready-to-upload zip next to this folder.',
-    'Drag that zip onto your wiki\'s shoppe plugin.',
+    'Drag that zip onto your wiki\'s agora plugin.',
     '',
     '## Re-uploading',
     '',
-    'Add or update content, then run `node shoppe-sign.js` again.',
+    'Add or update content, then run `node agora-sign.js` again.',
     'Each upload overwrites existing items and adds new ones.',
     '',
     '## Uploading videos',
     '',
-    'Run: `node shoppe-sign.js upload`',
+    'Run: `node agora-sign.js upload`',
     '',
-    'Opens your shoppe page with a signed URL (valid for 24 hours).',
+    'Opens your agora page with a signed URL (valid for 24 hours).',
     'Any video items without a file will show an "Upload Video" button.',
     '',
     '## Viewing orders',
     '',
-    'Run: `node shoppe-sign.js orders`',
+    'Run: `node agora-sign.js orders`',
     '',
     'Opens a signed link to your order dashboard (valid for 5 minutes).',
     '',
     '## Setting up payouts (Stripe)',
     '',
-    'Run: `node shoppe-sign.js payouts`',
+    'Run: `node agora-sign.js payouts`',
     '',
     'Opens Stripe Connect onboarding so you can receive payments.',
     'Do this once before your first sale.',
@@ -420,8 +559,8 @@ function generateBundleBuffer(tenant, ownerPrivateKey, ownerPubKey, wikiOrigin) 
 
   const zip = new AdmZip();
   zip.addFile('manifest.json',  Buffer.from(JSON.stringify(manifest, null, 2)));
-  zip.addFile('shoppe-key.json', Buffer.from(JSON.stringify(keyData, null, 2)));
-  zip.addFile('shoppe-sign.js', SIGN_SCRIPT);
+  zip.addFile('agora-key.json', Buffer.from(JSON.stringify(keyData, null, 2)));
+  zip.addFile('agora-sign.js', SIGN_SCRIPT);
   zip.addFile('package.json',   Buffer.from(packageJson));
   zip.addFile('README.md',      Buffer.from(readme));
 
@@ -476,7 +615,7 @@ function loadTenants() {
   try {
     return JSON.parse(fs.readFileSync(TENANTS_FILE, 'utf8'));
   } catch (err) {
-    console.warn('[shoppe] Failed to load tenants:', err.message);
+    console.warn('[agora] Failed to load tenants:', err.message);
     return {};
   }
 }
@@ -486,7 +625,7 @@ function saveTenants(tenants) {
 }
 
 function generateEmojicode(tenants) {
-  const base = [...SHOPPE_BASE_EMOJI].slice(0, 3).join('');
+  const base = [...AGORA_BASE_EMOJI].slice(0, 3).join('');
   const existing = new Set(Object.values(tenants).map(t => t.emojicode));
   for (let i = 0; i < 100; i++) {
     const shuffled = [...EMOJI_PALETTE].sort(() => Math.random() - 0.5);
@@ -539,7 +678,7 @@ async function registerTenant(name) {
   try {
     addieKeys = await addieCreateUser();
   } catch (err) {
-    console.warn('[shoppe] Could not create addie user (payouts unavailable):', err.message);
+    console.warn('[agora] Could not create addie user (payouts unavailable):', err.message);
   }
 
   // Create a dedicated Lucille user for video uploads
@@ -547,7 +686,7 @@ async function registerTenant(name) {
   try {
     lucilleKeys = await lucilleCreateUser();
   } catch (err) {
-    console.warn('[shoppe] Could not create lucille user (video uploads unavailable):', err.message);
+    console.warn('[agora] Could not create lucille user (video uploads unavailable):', err.message);
   }
 
   const ownerKeys = await generateOwnerKeyPair();
@@ -555,7 +694,7 @@ async function registerTenant(name) {
   const tenant = {
     uuid: sanoraUser.uuid,
     emojicode,
-    name: name || 'Unnamed Shoppe',
+    name: name || 'Unnamed Agora',
     keys,
     sanoraUser,
     addieKeys,
@@ -567,7 +706,7 @@ async function registerTenant(name) {
   tenants[sanoraUser.uuid] = tenant;
   saveTenants(tenants);
 
-  console.log(`[shoppe] Registered tenant: "${name}" ${emojicode} (${sanoraUser.uuid})`);
+  console.log(`[agora] Registered tenant: "${name}" ${emojicode} (${sanoraUser.uuid})`);
   // ownerPrivateKey is returned once so the caller can include it in the starter bundle.
   // It is NOT persisted server-side.
   return {
@@ -640,7 +779,7 @@ async function sanoraEnsureUser(tenant) {
   if (sanoraUser.error) throw new Error(`Sanora user ensure: ${sanoraUser.error}`);
 
   if (sanoraUser.uuid !== tenant.uuid) {
-    console.log(`[shoppe] Sanora UUID changed ${tenant.uuid} → ${sanoraUser.uuid} (Redis was reset). Updating tenants.json.`);
+    console.log(`[agora] Sanora UUID changed ${tenant.uuid} → ${sanoraUser.uuid} (Redis was reset). Updating tenants.json.`);
     const tenants = loadTenants();
     const oldUuid = tenant.uuid;
     tenant.uuid = sanoraUser.uuid;
@@ -661,7 +800,7 @@ async function fetchWithRetry(url, options, maxRetries = 3) {
     const resp = await fetch(url, options);
     if (resp.status !== 429 || attempt === maxRetries) return resp;
     const delay = 1000 * Math.pow(2, attempt);
-    console.warn(`[shoppe] 429 rate limited on ${new URL(url).pathname}, retrying in ${delay}ms…`);
+    console.warn(`[agora] 429 rate limited on ${new URL(url).pathname}, retrying in ${delay}ms…`);
     await sleep(delay);
   }
 }
@@ -709,7 +848,7 @@ async function sanoraCreateProductResilient(tenant, title, category, description
     return await sanoraCreateProduct(tenant, title, category, description, price, shipping, tags);
   } catch (err) {
     if (err.message.includes('not found') || err.message.includes('404')) {
-      console.warn(`[shoppe] Sanora user lost mid-upload, re-registering and retrying: ${title}`);
+      console.warn(`[agora] Sanora user lost mid-upload, re-registering and retrying: ${title}`);
       const updated = await sanoraEnsureUser(tenant);
       // Mutate tenant in place so all subsequent calls use the new UUID
       tenant.uuid = updated.uuid;
@@ -1016,7 +1155,7 @@ async function processArchive(zipPath, onProgress = () => {}) {
       } catch (err) {
         const msg = `info.json in "${path.basename(entryPath)}" is invalid JSON: ${err.message}`;
         results.warnings.push(msg);
-        console.warn(`[shoppe]   ⚠️  ${msg}`);
+        console.warn(`[agora]   ⚠️  ${msg}`);
         return {};
       }
     }
@@ -1053,9 +1192,9 @@ async function processArchive(zipPath, onProgress = () => {}) {
           }
 
           results.books.push({ title, price });
-          console.log(`[shoppe]   📚 book: ${title}`);
+          console.log(`[agora]   📚 book: ${title}`);
         } catch (err) {
-          console.warn(`[shoppe]   ⚠️  book ${entry}: ${err.message}`);
+          console.warn(`[agora]   ⚠️  book ${entry}: ${err.message}`);
         }
       }
     }
@@ -1089,9 +1228,9 @@ async function processArchive(zipPath, onProgress = () => {}) {
               await sanoraUploadArtifact(tenant, albumTitle, buf, track, 'audio');
             }
             results.music.push({ title: albumTitle, type: 'album', tracks: tracks.length });
-            console.log(`[shoppe]   🎵 album: ${albumTitle} (${tracks.length} tracks)`);
+            console.log(`[agora]   🎵 album: ${albumTitle} (${tracks.length} tracks)`);
           } catch (err) {
-            console.warn(`[shoppe]   ⚠️  album ${entry}: ${err.message}`);
+            console.warn(`[agora]   ⚠️  album ${entry}: ${err.message}`);
           }
         } else if (MUSIC_EXTS.has(path.extname(entry).toLowerCase())) {
           // Standalone track — supports a sidecar .json with same basename: { title, description, price }
@@ -1111,9 +1250,9 @@ async function processArchive(zipPath, onProgress = () => {}) {
             await sanoraCreateProductResilient(tenant, title, 'music', description, price, 0, buildTags('music,track', trackInfo.keywords));
             await sanoraUploadArtifact(tenant, title, buf, entry, 'audio');
             results.music.push({ title, type: 'track' });
-            console.log(`[shoppe]   🎵 track: ${title}`);
+            console.log(`[agora]   🎵 track: ${title}`);
           } catch (err) {
-            console.warn(`[shoppe]   ⚠️  track ${entry}: ${err.message}`);
+            console.warn(`[agora]   ⚠️  track ${entry}: ${err.message}`);
           }
         }
       }
@@ -1163,9 +1302,9 @@ async function processArchive(zipPath, onProgress = () => {}) {
               await sanoraUploadArtifact(tenant, seriesTitle, mdBuf, mdFiles[0], 'text');
             }
 
-            console.log(`[shoppe]   📝 series [${order + 1}]: ${seriesTitle} (${subDirs.length} parts)`);
+            console.log(`[agora]   📝 series [${order + 1}]: ${seriesTitle} (${subDirs.length} parts)`);
           } catch (err) {
-            console.warn(`[shoppe]   ⚠️  series ${entry}: ${err.message}`);
+            console.warn(`[agora]   ⚠️  series ${entry}: ${err.message}`);
           }
 
           // Register each part
@@ -1179,7 +1318,7 @@ async function processArchive(zipPath, onProgress = () => {}) {
             try {
               const partMdFiles = fs.readdirSync(partPath).filter(f => f.endsWith('.md'));
               if (partMdFiles.length === 0) {
-                console.warn(`[shoppe]   ⚠️  part ${partEntry}: no .md file, skipping`);
+                console.warn(`[agora]   ⚠️  part ${partEntry}: no .md file, skipping`);
                 continue;
               }
 
@@ -1211,9 +1350,9 @@ async function processArchive(zipPath, onProgress = () => {}) {
                 await sanoraUploadArtifact(tenant, productTitle, buf, asset, 'image');
               }
 
-              console.log(`[shoppe]     part ${partIndex + 1}: ${resolvedTitle}`);
+              console.log(`[agora]     part ${partIndex + 1}: ${resolvedTitle}`);
             } catch (err) {
-              console.warn(`[shoppe]   ⚠️  part ${partEntry}: ${err.message}`);
+              console.warn(`[agora]   ⚠️  part ${partEntry}: ${err.message}`);
             }
           }
 
@@ -1223,7 +1362,7 @@ async function processArchive(zipPath, onProgress = () => {}) {
           // Single post
           try {
             if (mdFiles.length === 0) {
-              console.warn(`[shoppe]   ⚠️  post ${entry}: no .md file found, skipping`);
+              console.warn(`[agora]   ⚠️  post ${entry}: no .md file found, skipping`);
               continue;
             }
             const mdBuf = fs.readFileSync(path.join(entryPath, mdFiles[0]));
@@ -1253,9 +1392,9 @@ async function processArchive(zipPath, onProgress = () => {}) {
             }
 
             results.posts.push({ title, order });
-            console.log(`[shoppe]   📝 post [${order + 1}]: ${title}`);
+            console.log(`[agora]   📝 post [${order + 1}]: ${title}`);
           } catch (err) {
-            console.warn(`[shoppe]   ⚠️  post ${entry}: ${err.message}`);
+            console.warn(`[agora]   ⚠️  post ${entry}: ${err.message}`);
           }
         }
       }
@@ -1281,9 +1420,9 @@ async function processArchive(zipPath, onProgress = () => {}) {
             await sanoraUploadArtifact(tenant, entry, buf, img, 'image');
           }
           results.albums.push({ title: entry, images: images.length });
-          console.log(`[shoppe]   🖼️  album: ${entry} (${images.length} images)`);
+          console.log(`[agora]   🖼️  album: ${entry} (${images.length} images)`);
         } catch (err) {
-          console.warn(`[shoppe]   ⚠️  album ${entry}: ${err.message}`);
+          console.warn(`[agora]   ⚠️  album ${entry}: ${err.message}`);
         }
       }
     }
@@ -1319,15 +1458,15 @@ async function processArchive(zipPath, onProgress = () => {}) {
               const heroBuf = fs.readFileSync(path.join(entryPath, heroFile));
               await sanoraUploadImage(tenant, title, heroBuf, heroFile);
             } catch (imgErr) {
-              console.warn(`[shoppe]   ⚠️  image upload for ${title}: ${imgErr.message}`);
+              console.warn(`[agora]   ⚠️  image upload for ${title}: ${imgErr.message}`);
               results.warnings.push(`Image upload for "${title}" failed: ${imgErr.message}`);
             }
           }
 
           results.products.push({ title, order, price, shipping });
-          console.log(`[shoppe]   📦 product [${order + 1}]: ${title} ($${price} + $${shipping} shipping)`);
+          console.log(`[agora]   📦 product [${order + 1}]: ${title} ($${price} + $${shipping} shipping)`);
         } catch (err) {
-          console.warn(`[shoppe]   ⚠️  product ${entry}: ${err.message}`);
+          console.warn(`[agora]   ⚠️  product ${entry}: ${err.message}`);
         }
       }
     }
@@ -1380,9 +1519,9 @@ async function processArchive(zipPath, onProgress = () => {}) {
           }
 
           results.subscriptions.push({ title, price, renewalDays: tierMeta.renewalDays });
-          console.log(`[shoppe]   🎁 subscription tier: ${title} ($${price}/mo, ${exclusiveFiles.length} exclusive files)`);
+          console.log(`[agora]   🎁 subscription tier: ${title} ($${price}/mo, ${exclusiveFiles.length} exclusive files)`);
         } catch (err) {
-          console.warn(`[shoppe]   ⚠️  subscription ${entry}: ${err.message}`);
+          console.warn(`[agora]   ⚠️  subscription ${entry}: ${err.message}`);
         }
       }
     }
@@ -1393,10 +1532,10 @@ async function processArchive(zipPath, onProgress = () => {}) {
     // Video is uploaded to Lucille (DO Spaces + WebTorrent seeder); Sanora holds the catalog entry.
     //
     // The manifest may specify a lucilleUrl to override the plugin's global config — this lets
-    // different shoppe tenants point to different Lucille instances.
+    // different agora tenants point to different Lucille instances.
     //
     // Deduplication: Lucille stores a SHA-256 contentHash for each uploaded file. Before uploading,
-    // shoppe computes the local file's hash and skips the upload if it matches what Lucille has.
+    // agora computes the local file's hash and skips the upload if it matches what Lucille has.
     const videosDir = path.join(root, 'videos');
     if (fs.existsSync(videosDir)) {
       const effectiveLucilleUrl = (manifest.lucilleUrl || '').replace(/\/$/, '') || null;
@@ -1445,9 +1584,9 @@ async function processArchive(zipPath, onProgress = () => {}) {
           // Register video metadata in Lucille (file upload happens separately via upload-info endpoint)
           await lucilleRegisterVideo(tenant, title, description, tags, effectiveLucilleUrl);
           results.videos.push({ title, price });
-          console.log(`[shoppe]   🎬 video registered: ${title} (upload file separately)`);
+          console.log(`[agora]   🎬 video registered: ${title} (upload file separately)`);
         } catch (err) {
-          console.warn(`[shoppe]   ⚠️  video ${entry}: ${err.message}`);
+          console.warn(`[agora]   ⚠️  video ${entry}: ${err.message}`);
           results.warnings.push(`video "${entry}": ${err.message}`);
         }
       }
@@ -1494,9 +1633,9 @@ async function processArchive(zipPath, onProgress = () => {}) {
           }
 
           results.appointments.push({ title, price, duration: schedule.duration });
-          console.log(`[shoppe]   📅 appointment: ${title} ($${price}/session, ${schedule.duration}min)`);
+          console.log(`[agora]   📅 appointment: ${title} ($${price}/session, ${schedule.duration}min)`);
         } catch (err) {
-          console.warn(`[shoppe]   ⚠️  appointment ${entry}: ${err.message}`);
+          console.warn(`[agora]   ⚠️  appointment ${entry}: ${err.message}`);
         }
       }
     }
@@ -1515,14 +1654,14 @@ async function processArchive(zipPath, onProgress = () => {}) {
 // PORTFOLIO PAGE GENERATION
 // ============================================================
 
-async function getShoppeGoods(tenant, imageBaseUrl) {
+async function getAgoraGoods(tenant, imageBaseUrl) {
   let products = {};
   try {
     const resp = await fetch(`${getSanoraUrl()}/products/${tenant.uuid}`, { timeout: 15000 });
     if (resp.ok) products = await resp.json();
-    else console.warn(`[shoppe] getShoppeGoods: Sanora returned ${resp.status} for ${tenant.uuid}`);
+    else console.warn(`[agora] getAgoraGoods: Sanora returned ${resp.status} for ${tenant.uuid}`);
   } catch (err) {
-    console.warn(`[shoppe] getShoppeGoods: Sanora unreachable — ${err.message}`);
+    console.warn(`[agora] getAgoraGoods: Sanora unreachable — ${err.message}`);
   }
   const redirects = tenant.redirects || {};
 
@@ -1548,17 +1687,17 @@ async function getShoppeGoods(tenant, imageBaseUrl) {
     }
 
     const defaultUrl = isPost
-      ? `/plugin/shoppe/${tenant.uuid}/post/${encodeURIComponent(title)}`
+      ? `/plugin/agora/${tenant.uuid}/post/${encodeURIComponent(title)}`
       : product.category === 'book'
-        ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
+        ? `/plugin/agora/${tenant.uuid}/buy/${encodeURIComponent(title)}`
         : product.category === 'subscription'
-          ? `/plugin/shoppe/${tenant.uuid}/subscribe/${encodeURIComponent(title)}`
+          ? `/plugin/agora/${tenant.uuid}/subscribe/${encodeURIComponent(title)}`
           : product.category === 'appointment'
-            ? `/plugin/shoppe/${tenant.uuid}/book/${encodeURIComponent(title)}`
+            ? `/plugin/agora/${tenant.uuid}/book/${encodeURIComponent(title)}`
           : product.category === 'product' && product.shipping > 0
-            ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}/address`
+            ? `/plugin/agora/${tenant.uuid}/buy/${encodeURIComponent(title)}/address`
             : product.category === 'product'
-              ? `/plugin/shoppe/${tenant.uuid}/buy/${encodeURIComponent(title)}`
+              ? `/plugin/agora/${tenant.uuid}/buy/${encodeURIComponent(title)}`
               : product.category === 'video' && lucillePlayerUrl
                 ? lucillePlayerUrl
                 : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`;
@@ -1574,7 +1713,7 @@ async function getShoppeGoods(tenant, imageBaseUrl) {
       url: resolvedUrl,
       ...(isPost && { category: product.category, tags: product.tags || '' }),
       ...(lucillePlayerUrl && { lucillePlayerUrl }),
-      ...(product.category === 'video' && { shoppeId: tenant.uuid })
+      ...(product.category === 'video' && { agoraId: tenant.uuid })
     };
     const bucket = goods[bucketName];
     if (bucket) bucket.push(item);
@@ -1733,11 +1872,11 @@ const CATEGORY_EMOJI = { book: '📚', music: '🎵', post: '📝', album: '🖼
 // Expects req.query.timestamp and req.query.signature.
 // Returns an error string if invalid, null if valid.
 function checkOwnerSignature(req, tenant, maxAgeMs = 5 * 60 * 1000) {
-  if (!tenant.ownerPubKey) return 'This shoppe was registered before owner signing was added';
+  if (!tenant.ownerPubKey) return 'This agora was registered before owner signing was added';
   const { timestamp, signature } = req.query;
-  if (!timestamp || !signature) return 'Missing timestamp or signature — generate a fresh URL with: node shoppe-sign.js orders';
+  if (!timestamp || !signature) return 'Missing timestamp or signature — generate a fresh URL with: node agora-sign.js orders';
   const age = Date.now() - parseInt(timestamp, 10);
-  if (isNaN(age) || age < 0 || age > maxAgeMs) return 'URL has expired — generate a new one with: node shoppe-sign.js orders';
+  if (isNaN(age) || age < 0 || age > maxAgeMs) return 'URL has expired — generate a new one with: node agora-sign.js orders';
   const message = timestamp + tenant.uuid;
   if (!sessionless.verifySignature(signature, message, tenant.ownerPubKey)) return 'Signature invalid';
   return null;
@@ -1752,7 +1891,7 @@ async function getAllOrders(tenant) {
     const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`, { timeout: 15000 });
     if (productsResp.ok) products = await productsResp.json();
   } catch (err) {
-    console.warn(`[shoppe] getAllOrders: Sanora unreachable — ${err.message}`);
+    console.warn(`[agora] getAllOrders: Sanora unreachable — ${err.message}`);
   }
 
 
@@ -1814,7 +1953,7 @@ function generateOrdersHTML(tenant, orderData) {
   }).join('');
 
   const empty = totalOrders === 0
-    ? '<p class="empty">No orders yet. Share your shoppe link to get started!</p>'
+    ? '<p class="empty">No orders yet. Share your agora link to get started!</p>'
     : '';
 
   return `<!DOCTYPE html>
@@ -1862,7 +2001,7 @@ function generateOrdersHTML(tenant, orderData) {
     <div class="stat"><div class="stat-val">${orderData.length}</div><div class="stat-lbl">Products sold</div></div>
   </div>
   <div class="main">
-    <a class="back" href="/plugin/shoppe/${tenant.uuid}">← Back to shoppe</a>
+    <a class="back" href="/plugin/agora/${tenant.uuid}">← Back to agora</a>
     <div class="warning">🔑 Key hashes are shown (not recovery keys — those never reach this server). Revenue totals are approximate when order amounts aren't stored.</div>
     ${empty}
     ${sections}
@@ -1877,7 +2016,7 @@ function renderCards(items, category) {
   }
   return items.map(item => {
     const isVideo = !!item.lucillePlayerUrl;
-    const isUnuploadedVideo = item.shoppeId && !item.lucillePlayerUrl;
+    const isUnuploadedVideo = item.agoraId && !item.lucillePlayerUrl;
     const imgHtml = item.image
       ? `<div class="card-img${isVideo ? ' card-video-play' : ''}"><img src="${item.image}" alt="" loading="lazy"></div>`
       : isUnuploadedVideo
@@ -1889,17 +2028,17 @@ function renderCards(items, category) {
     if (isUnuploadedVideo) {
       const safeTitle = item.title.replace(/'/g, "\\'");
       return `
-      <div class="card" id="video-card-${item.shoppeId}-${item.title.replace(/[^a-z0-9]/gi,'_')}">
+      <div class="card" id="video-card-${item.agoraId}-${item.title.replace(/[^a-z0-9]/gi,'_')}">
         ${imgHtml}
         <div class="card-body">
           <div class="card-title">${item.title}</div>
           ${item.description ? `<div class="card-desc">${item.description}</div>` : ''}
           ${priceHtml}
-          <div class="video-upload-area" id="upload-area-${item.shoppeId}-${item.title.replace(/[^a-z0-9]/gi,'_')}">
+          <div class="video-upload-area" id="upload-area-${item.agoraId}-${item.title.replace(/[^a-z0-9]/gi,'_')}">
             <label class="upload-btn-label">
               📁 Upload Video
               <input type="file" accept="video/*" style="display:none"
-                onchange="startVideoUpload(this,'${item.shoppeId}','${safeTitle}')">
+                onchange="startVideoUpload(this,'${item.agoraId}','${safeTitle}')">
             </label>
             <div class="upload-progress" style="display:none"></div>
           </div>
@@ -1911,7 +2050,7 @@ function renderCards(items, category) {
       ? `playVideo('${item.lucillePlayerUrl}')`
       : `window.open('${escHtml(targetUrl)}','_blank')`;
     const saveBtn = (item.price > 0 && item.productId)
-      ? `<button class="save-shoppere-btn" onclick="event.stopPropagation();saveToShoppere(${JSON.stringify(item.title)},${JSON.stringify(item.productId)},${item.price},${JSON.stringify(category)})" title="Save to Shoppere wallet">📱 Save</button>`
+      ? `<button class="save-polites-btn" onclick="event.stopPropagation();saveToPolites(${JSON.stringify(item.title)},${JSON.stringify(item.productId)},${item.price},${JSON.stringify(category)})" title="Save to Polites wallet">📱 Save</button>`
       : '';
     return `
       <div class="card" onclick="${clickHandler}">
@@ -1926,7 +2065,7 @@ function renderCards(items, category) {
   }).join('');
 }
 
-function generateShoppeHTML(tenant, goods, uploadAuth = null) {
+function generateAgoraHTML(tenant, goods, uploadAuth = null) {
   const total = Object.values(goods).flat().length;
   const tabs = [
     { id: 'all',          label: 'All',              count: total,                       always: true },
@@ -1953,13 +2092,13 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
   <title>${tenant.name}</title>
   ${tenant.keywords ? `<meta name="keywords" content="${escHtml(tenant.keywords)}">` : ''}
   <script>
-    const _shoppeId   = ${JSON.stringify(tenant.uuid)};
-    const _shoppeName = ${JSON.stringify(tenant.name)};
-    function saveToShoppere(title, productId, price, category) {
-      const url = 'shoppere://product?'
+    const _agoraId   = ${JSON.stringify(tenant.uuid)};
+    const _agoraName = ${JSON.stringify(tenant.name)};
+    function saveToPolites(title, productId, price, category) {
+      const url = 'polites://product?'
         + 'd=' + encodeURIComponent(window.location.hostname)
-        + '&s=' + encodeURIComponent(_shoppeId)
-        + '&n=' + encodeURIComponent(_shoppeName)
+        + '&s=' + encodeURIComponent(_agoraId)
+        + '&n=' + encodeURIComponent(_agoraName)
         + '&t=' + encodeURIComponent(title)
         + '&i=' + encodeURIComponent(productId || title)
         + '&p=' + price
@@ -2046,8 +2185,8 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
     .card-desc { font-size: 13px; color: var(--text-2); margin-bottom: 8px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
     .price { font-size: 15px; font-weight: 700; color: var(--accent); }
     .shipping { font-size: 12px; font-weight: 400; color: var(--text-3); }
-    .save-shoppere-btn { margin-top: 8px; background: none; border: 1px solid var(--border); border-radius: 14px; color: var(--text-3); font-size: 11px; padding: 4px 10px; cursor: pointer; display: inline-block; }
-    .save-shoppere-btn:active { opacity: 0.6; }
+    .save-polites-btn { margin-top: 8px; background: none; border: 1px solid var(--border); border-radius: 14px; color: var(--text-3); font-size: 11px; padding: 4px 10px; cursor: pointer; display: inline-block; }
+    .save-polites-btn:active { opacity: 0.6; }
     .empty { color: var(--text-3); text-align: center; padding: 60px 0; font-size: 15px; }
     .card-video-play { position: relative; }
     .card-video-play::after { content: '▶'; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 36px; color: rgba(255,255,255,0.9); background: rgba(0,0,0,0.35); opacity: 0; transition: opacity 0.2s; pointer-events: none; }
@@ -2219,7 +2358,7 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
     <div id="subscriptions" class="section">
       <div id="subscriptions-list"></div>
       <div style="text-align:center;padding:12px 0 8px;font-size:13px;color:#888;">
-        Already infusing? <a href="/plugin/shoppe/${tenant.uuid}/membership" style="color:#0066cc;">Access your membership →</a>
+        Already infusing? <a href="/plugin/agora/${tenant.uuid}/membership" style="color:#0066cc;">Access your membership →</a>
       </div>
     </div>
   </main>
@@ -2370,7 +2509,7 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
       const grid = document.getElementById('music-album-grid');
       grid.innerHTML = '<p class="empty">Loading music\u2026</p>';
       try {
-        const resp = await fetch('/plugin/shoppe/${tenant.uuid}/music/feed');
+        const resp = await fetch('/plugin/agora/${tenant.uuid}/music/feed');
         const data = await resp.json();
         _musicAlbums = data.albums || [];
         _musicTracks = data.tracks || [];
@@ -2566,7 +2705,7 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
                 <div class="icon">🎉</div>
                 <h3>Thank you for infusing!</h3>
                 <div class="renews" id="sub-confirm-renews-\${i}"></div>
-                <p style="font-size:13px;color:#888;margin:8px 0 14px;">Use your recovery key at the <a href="/plugin/shoppe/${tenant.uuid}/membership" style="color:#0066cc;">membership portal</a> to access exclusive content.</p>
+                <p style="font-size:13px;color:#888;margin:8px 0 14px;">Use your recovery key at the <a href="/plugin/agora/${tenant.uuid}/membership" style="color:#0066cc;">membership portal</a> to access exclusive content.</p>
               </div>
             </div>
           </div>
@@ -2590,7 +2729,7 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
       if (!recoveryKey) { errEl.textContent = 'Recovery key is required.'; errEl.style.display = 'block'; return; }
       errEl.style.display = 'none';
       try {
-        const resp = await fetch('/plugin/shoppe/${tenant.uuid}/purchase/intent', {
+        const resp = await fetch('/plugin/agora/${tenant.uuid}/purchase/intent', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ recoveryKey, productId: tier.productId, title: tier.title })
         });
@@ -2628,7 +2767,7 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
         if (error) { payError.textContent = error.message; payError.style.display = 'block'; payBtn.disabled = false; payLoading.style.display = 'none'; return; }
         const recoveryKey = document.getElementById(\`sub-rkey-\${i}\`).value.trim();
         const paymentIntentId = _subClientSecrets[i] ? _subClientSecrets[i].split('_secret_')[0] : undefined;
-        await fetch('/plugin/shoppe/${tenant.uuid}/purchase/complete', {
+        await fetch('/plugin/agora/${tenant.uuid}/purchase/complete', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ recoveryKey, productId: tier.productId, title: tier.title, amount: tier.price, type: 'subscription', renewalDays: tier.renewalDays || 30, paymentIntentId })
         });
@@ -2732,7 +2871,7 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
       const loadingEl = document.getElementById(\`appt-loading-\${i}\`);
       const noSlotsEl = document.getElementById(\`appt-no-slots-\${i}\`);
       try {
-        const resp = await fetch('/plugin/shoppe/${tenant.uuid}/book/' + encodeURIComponent(appt.title) + '/slots');
+        const resp = await fetch('/plugin/agora/${tenant.uuid}/book/' + encodeURIComponent(appt.title) + '/slots');
         const data = await resp.json();
         loadingEl.style.display = 'none';
         if (!data.available || !data.available.length) { noSlotsEl.style.display = 'block'; return; }
@@ -2835,14 +2974,14 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
       errEl.style.display = 'none';
       document.getElementById(\`appt-proceed-btn-\${i}\`).disabled = true;
       try {
-        const resp = await fetch('/plugin/shoppe/${tenant.uuid}/purchase/intent', {
+        const resp = await fetch('/plugin/agora/${tenant.uuid}/purchase/intent', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ recoveryKey, productId: appt.productId, title: appt.title, slotDatetime: selectedSlot })
         });
         const data = await resp.json();
         if (data.error) { errEl.textContent = data.error; errEl.style.display = 'block'; document.getElementById(\`appt-proceed-btn-\${i}\`).disabled = false; return; }
         if (data.free) {
-          await fetch('/plugin/shoppe/${tenant.uuid}/purchase/complete', {
+          await fetch('/plugin/agora/${tenant.uuid}/purchase/complete', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ recoveryKey, productId: appt.productId, title: appt.title, slotDatetime: selectedSlot, contactInfo: { name, email } })
           });
@@ -2882,7 +3021,7 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
         const email = document.getElementById(\`appt-email-\${i}\`).value.trim();
         const selectedSlot = _apptState[i] && _apptState[i].selectedSlot;
         const paymentIntentId = _apptSecrets[i] ? _apptSecrets[i].split('_secret_')[0] : undefined;
-        await fetch('/plugin/shoppe/${tenant.uuid}/purchase/complete', {
+        await fetch('/plugin/agora/${tenant.uuid}/purchase/complete', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ recoveryKey, productId: appt.productId, title: appt.title, slotDatetime: selectedSlot, contactInfo: { name, email }, paymentIntentId })
         });
@@ -2901,11 +3040,11 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
       conf.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
-    async function startVideoUpload(input, shoppeId, title) {
+    async function startVideoUpload(input, agoraId, title) {
       const file = input.files[0];
       if (!file) return;
 
-      const areaId = 'upload-area-' + shoppeId + '-' + title.replace(/[^a-z0-9]/gi,'_');
+      const areaId = 'upload-area-' + agoraId + '-' + title.replace(/[^a-z0-9]/gi,'_');
       const area = document.getElementById(areaId);
       const progressDiv = area.querySelector('.upload-progress');
       const label = area.querySelector('.upload-btn-label');
@@ -2915,9 +3054,9 @@ function generateShoppeHTML(tenant, goods, uploadAuth = null) {
       progressDiv.innerHTML = 'Getting upload credentials…';
 
       try {
-        if (!UPLOAD_AUTH) throw new Error('Not authorized to upload — visit the shoppe via a signed URL (node shoppe-sign.js upload)');
+        if (!UPLOAD_AUTH) throw new Error('Not authorized to upload — visit the agora via a signed URL (node agora-sign.js upload)');
         const authParams = '?timestamp=' + encodeURIComponent(UPLOAD_AUTH.timestamp) + '&signature=' + encodeURIComponent(UPLOAD_AUTH.signature);
-        const infoRes = await fetch('/plugin/shoppe/' + shoppeId + '/video/' + encodeURIComponent(title) + '/upload-info' + authParams);
+        const infoRes = await fetch('/plugin/agora/' + agoraId + '/video/' + encodeURIComponent(title) + '/upload-info' + authParams);
         if (!infoRes.ok) throw new Error('Could not get upload credentials (' + infoRes.status + ')');
         const { uploadUrl, timestamp, signature } = await infoRes.json();
 
@@ -2989,7 +3128,7 @@ function generatePostHTML(tenant, title, date, imageUrl, markdownBody) {
   </style>
 </head>
 <body>
-  <div class="back-bar"><a href="/plugin/shoppe/${tenant.uuid}">← ${escHtml(tenant.name)}</a></div>
+  <div class="back-bar"><a href="/plugin/agora/${tenant.uuid}">← ${escHtml(tenant.name)}</a></div>
   ${imageUrl ? `<img class="hero" src="${imageUrl}" alt="">` : ''}
   <div class="post-header">
     <h1>${escHtml(title)}</h1>
@@ -3009,13 +3148,13 @@ async function startServer(params) {
 
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(TMP_DIR))  fs.mkdirSync(TMP_DIR,  { recursive: true });
-  console.log('🛍️  wiki-plugin-shoppe starting...');
+  console.log('🛍️  wiki-plugin-agora starting...');
 
-  // Allow Shoppere desktop/mobile app (tauri://localhost) to call our JSON API
-  const SHOPPERE_ORIGINS = ['tauri://localhost', 'https://tauri.localhost'];
-  app.use('/plugin/shoppe', (req, res, next) => {
+  // Allow Polites desktop/mobile app (tauri://localhost) to call our JSON API
+  const POLITES_ORIGINS = ['tauri://localhost', 'https://tauri.localhost'];
+  app.use('/plugin/agora', (req, res, next) => {
     const origin = req.headers.origin;
-    if (origin && SHOPPERE_ORIGINS.includes(origin)) {
+    if (origin && POLITES_ORIGINS.includes(origin)) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -3037,7 +3176,7 @@ async function startServer(params) {
   });
 
   // Register a new tenant (owner only)
-  app.post('/plugin/shoppe/register', owner, async (req, res) => {
+  app.post('/plugin/agora/register', owner, async (req, res) => {
     try {
       const { uuid, emojicode, name, ownerPrivateKey, ownerPubKey } = await registerTenant(req.body.name);
 
@@ -3051,14 +3190,14 @@ async function startServer(params) {
 
       res.json({ success: true, tenant: { uuid, emojicode, name }, bundleToken: token });
     } catch (err) {
-      console.error('[shoppe] register error:', err);
+      console.error('[agora] register error:', err);
       res.status(500).json({ success: false, error: err.message });
     }
   });
 
   // Starter bundle download — single-use token acts as the credential.
-  // The zip contains manifest.json, shoppe-key.json (private key), shoppe-sign.js, and empty content folders.
-  app.get('/plugin/shoppe/bundle/:token', (req, res) => {
+  // The zip contains manifest.json, agora-key.json (private key), agora-sign.js, and empty content folders.
+  app.get('/plugin/agora/bundle/:token', (req, res) => {
     const entry = bundleTokens.get(req.params.token);
     if (!entry) {
       return res.status(404).send('<h1>Bundle link expired or invalid</h1><p>Re-register to get a new link.</p>');
@@ -3076,29 +3215,29 @@ async function startServer(params) {
 
     try {
       const buf = generateBundleBuffer(tenant, entry.ownerPrivateKey, entry.ownerPubKey, entry.wikiOrigin);
-      const filename = `${tenant.name.replace(/[^a-z0-9-]/gi, '-').toLowerCase()}-shoppe-starter.zip`;
+      const filename = `${tenant.name.replace(/[^a-z0-9-]/gi, '-').toLowerCase()}-agora-starter.zip`;
       res.set('Content-Type', 'application/zip');
       res.set('Content-Disposition', `attachment; filename="${filename}"`);
       res.send(buf);
-      console.log(`[shoppe] Starter bundle downloaded for "${tenant.name}" (${tenant.uuid})`);
+      console.log(`[agora] Starter bundle downloaded for "${tenant.name}" (${tenant.uuid})`);
     } catch (err) {
-      console.error('[shoppe] bundle error:', err);
+      console.error('[agora] bundle error:', err);
       res.status(500).send('<h1>Error generating bundle</h1><p>' + err.message + '</p>');
     }
   });
 
   // List all tenants (owner only — includes uuid for management)
-  app.get('/plugin/shoppe/tenants', owner, (req, res) => {
+  app.get('/plugin/agora/tenants', owner, (req, res) => {
     const tenants = loadTenants();
     const safe = Object.values(tenants).map(({ uuid, emojicode, name, createdAt }) => ({
       uuid, emojicode, name, createdAt,
-      url: `/plugin/shoppe/${uuid}`
+      url: `/plugin/agora/${uuid}`
     }));
     res.json({ success: true, tenants: safe });
   });
 
-  // Delete a shoppe tenant (owner only)
-  app.delete('/plugin/shoppe/:identifier', owner, async (req, res) => {
+  // Delete an agora tenant (owner only)
+  app.delete('/plugin/agora/:identifier', owner, async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).json({ error: 'tenant not found' });
@@ -3110,11 +3249,11 @@ async function startServer(params) {
         .then(products => {
           for (const title of Object.keys(products)) {
             sanoraDeleteProduct(tenant, title).catch(err =>
-              console.warn(`[shoppe] delete product "${title}" failed:`, err.message)
+              console.warn(`[agora] delete product "${title}" failed:`, err.message)
             );
           }
         })
-        .catch(err => console.warn('[shoppe] fetch products for delete failed:', err.message));
+        .catch(err => console.warn('[agora] fetch products for delete failed:', err.message));
 
       // Remove tenant from local registry
       const tenants = loadTenants();
@@ -3127,18 +3266,18 @@ async function startServer(params) {
     }
   });
 
-  // Public directory — name, emojicode, and shoppe URL only
-  app.get('/plugin/shoppe/directory', (req, res) => {
+  // Public directory — name, emojicode, and agora URL only
+  app.get('/plugin/agora/directory', (req, res) => {
     const tenants = loadTenants();
     const listing = Object.values(tenants).map(({ uuid, emojicode, name }) => ({
       name, emojicode,
-      url: `/plugin/shoppe/${uuid}`
+      url: `/plugin/agora/${uuid}`
     }));
-    res.json({ success: true, shoppes: listing });
+    res.json({ success: true, agoras: listing });
   });
 
   // Upload goods archive (auth via manifest uuid+emojicode)
-  app.post('/plugin/shoppe/upload', upload.single('archive'), (req, res) => {
+  app.post('/plugin/agora/upload', upload.single('archive'), (req, res) => {
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No archive uploaded' });
     }
@@ -3156,10 +3295,17 @@ async function startServer(params) {
     }
 
     const zipPath = req.file.path;
-    console.log('[shoppe] Processing archive:', req.file.originalname);
+    console.log('[agora] Processing archive:', req.file.originalname);
     processArchive(zipPath, emit)
-      .then(result  => emit('complete', { success: true, ...result }))
-      .catch(err    => { console.error('[shoppe] upload error:', err); emit('error', { message: err.message }); })
+      .then(result => {
+        emit('complete', { success: true, ...result });
+        // Update the wiki catalog page for federation search (fire-and-forget)
+        const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
+        writeAgoraWikiPage(req, result.tenant, wikiOrigin).catch(err =>
+          console.warn('[agora] Wiki page write failed:', err.message)
+        );
+      })
+      .catch(err    => { console.error('[agora] upload error:', err); emit('error', { message: err.message }); })
       .finally(() => {
         job.done = true;
         if (job.sse) { job.sse.end(); job.sse = null; }
@@ -3167,7 +3313,7 @@ async function startServer(params) {
       });
   });
 
-  app.get('/plugin/shoppe/upload/progress/:jobId', (req, res) => {
+  app.get('/plugin/agora/upload/progress/:jobId', (req, res) => {
     const job = uploadJobs.get(req.params.jobId);
     if (!job) return res.status(404).json({ error: 'Unknown job' });
 
@@ -3188,13 +3334,19 @@ async function startServer(params) {
   });
 
   // Get config (owner only)
-  app.get('/plugin/shoppe/config', owner, (req, res) => {
+  app.get('/plugin/agora/config', owner, (req, res) => {
     const config = loadConfig();
-    res.json({ success: true, sanoraUrl: config.sanoraUrl || '', lucilleUrl: config.lucilleUrl || '' });
+    res.json({
+      success: true,
+      sanoraUrl: config.sanoraUrl || '',
+      lucilleUrl: config.lucilleUrl || '',
+      stripeOnboarded: !!config.stripeOnboarded,
+      serverAddieReady: !!(config.serverAddie && config.serverAddie.uuid)
+    });
   });
 
   // Save config (owner only)
-  app.post('/plugin/shoppe/config', owner, (req, res) => {
+  app.post('/plugin/agora/config', owner, async (req, res) => {
     const { sanoraUrl, addieUrl, lucilleUrl } = req.body;
     if (!sanoraUrl) return res.status(400).json({ success: false, error: 'sanoraUrl required' });
     const config = loadConfig();
@@ -3202,15 +3354,75 @@ async function startServer(params) {
     if (addieUrl) config.addieUrl = addieUrl;
     if (lucilleUrl) config.lucilleUrl = lucilleUrl;
     saveConfig(config);
-    console.log('[shoppe] Sanora URL set to:', sanoraUrl);
-    res.json({ success: true });
+    console.log('[agora] Sanora URL set to:', sanoraUrl);
+
+    // Ensure the server has an Addie user (non-blocking; errors are warnings only)
+    let serverAddieReady = !!(config.serverAddie && config.serverAddie.uuid);
+    try {
+      await ensureServerAddieUser();
+      serverAddieReady = true;
+    } catch (err) {
+      console.warn('[agora] Could not create server Addie user:', err.message);
+    }
+
+    const updatedConfig = loadConfig();
+    res.json({ success: true, stripeOnboarded: !!updatedConfig.stripeOnboarded, serverAddieReady });
   });
 
-  // Purchase pages — shoppe-hosted versions of the Sanora payment templates
+  // Stripe Connect Express onboarding for the server itself (owner only)
+  app.get('/plugin/agora/setup/stripe', owner, async (req, res) => {
+    try {
+      const serverAddie = await ensureServerAddieUser();
+      const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
+      const refreshUrl = `${wikiOrigin}/plugin/agora/setup/stripe`;
+      const returnUrl  = `${wikiOrigin}/plugin/agora/setup/stripe/done`;
+      const email      = `agora@${req.get('host').replace(/:\d+$/, '')}`;
+      const country    = 'US';
+      const timestamp  = Date.now().toString();
+      const signature  = signMessage(timestamp + serverAddie.uuid + email, serverAddie.privateKey);
+
+      const resp = await fetch(`${getAddieUrl()}/user/${serverAddie.uuid}/processor/stripe/express`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timestamp, country, email, refreshUrl, returnUrl, signature })
+      });
+
+      const result = await resp.json();
+      if (result.error) {
+        console.error('[agora] Stripe Express setup error:', result.error);
+        return res.status(500).send(`<h1>Stripe setup error</h1><p>${result.error}</p>`);
+      }
+
+      const onboardingUrl = result.stripeOnboardingUrl;
+      if (!onboardingUrl) return res.status(500).send('<h1>No onboarding URL returned from Addie</h1>');
+
+      res.redirect(onboardingUrl);
+    } catch (err) {
+      console.error('[agora] Stripe setup error:', err);
+      res.status(500).send(`<h1>Setup failed</h1><p>${err.message}</p>`);
+    }
+  });
+
+  // Return URL after Stripe Connect Express onboarding completes
+  app.get('/plugin/agora/setup/stripe/done', (req, res) => {
+    const config = loadConfig();
+    config.stripeOnboarded = true;
+    saveConfig(config);
+    res.send(`<!doctype html><html><head><title>Stripe Setup Complete</title>
+      <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:560px;margin:80px auto;text-align:center;color:#1d1d1f;}
+      h1{font-size:28px;margin-bottom:12px;} p{font-size:15px;color:#555;line-height:1.6;}
+      a{display:inline-block;margin-top:24px;padding:12px 28px;background:#0066cc;color:white;border-radius:20px;text-decoration:none;font-weight:600;}
+      a:hover{background:#0055aa;}</style></head>
+      <body><h1>✅ Server payouts enabled</h1>
+      <p>Your agora server is now connected to Stripe. You'll receive a platform fee from all purchases across your tenants' agoras.</p>
+      <a href="javascript:window.close()">Close this tab</a></body></html>`);
+  });
+
+  // Purchase pages — agora-hosted versions of the Sanora payment templates
   async function renderPurchasePage(req, res, templateHtml) {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+      if (!tenant) return res.status(404).send('<h1>Agora not found</h1>');
 
       const title = decodeURIComponent(req.params.title);
       const sanoraUrlInternal = getSanoraUrl();
@@ -3222,13 +3434,13 @@ async function startServer(params) {
       if (!product) return res.status(404).send('<h1>Product not found</h1>');
 
       const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
-      const ebookUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}/download/${encodeURIComponent(title)}`;
-      const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
+      const ebookUrl = `${wikiOrigin}/plugin/agora/${tenant.uuid}/download/${encodeURIComponent(title)}`;
+      const agoraUrl = `${wikiOrigin}/plugin/agora/${tenant.uuid}`;
       const payees = tenant.addieKeys
         ? JSON.stringify([{ pubKey: tenant.addieKeys.pubKey, amount: product.price || 0 }])
         : '[]';
 
-      // Forward Shoppere credentials if present in the query string
+      // Forward Polites credentials if present in the query string
       const buyerPubKey    = req.query.pubKey    || '';
       const buyerTimestamp = req.query.timestamp || '';
       const buyerSignature = req.query.signature || '';
@@ -3252,7 +3464,7 @@ async function startServer(params) {
         sanoraUrl,
         allyabaseOrigin: wikiOrigin,
         ebookUrl:        ebookUrlWithCreds,
-        shoppeUrl,
+        agoraUrl,
         payees,
         tenantUuid:      tenant.uuid,
         keywords:        extractKeywords(product),
@@ -3265,24 +3477,24 @@ async function startServer(params) {
       res.set('Content-Type', 'text/html');
       res.send(html);
     } catch (err) {
-      console.error('[shoppe] purchase page error:', err);
+      console.error('[agora] purchase page error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
     }
   }
 
   // Books + no-shipping products → recovery key + stripe
-  app.get('/plugin/shoppe/:identifier/buy/:title', (req, res) =>
+  app.get('/plugin/agora/:identifier/buy/:title', (req, res) =>
     renderPurchasePage(req, res, RECOVER_STRIPE_TMPL));
 
   // Physical products with shipping → address + stripe
-  app.get('/plugin/shoppe/:identifier/buy/:title/address', (req, res) =>
+  app.get('/plugin/agora/:identifier/buy/:title/address', (req, res) =>
     renderPurchasePage(req, res, ADDRESS_STRIPE_TMPL));
 
   // Appointment booking page
-  app.get('/plugin/shoppe/:identifier/book/:title', async (req, res) => {
+  app.get('/plugin/agora/:identifier/book/:title', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+      if (!tenant) return res.status(404).send('<h1>Agora not found</h1>');
 
       const title = decodeURIComponent(req.params.title);
       const sanoraUrl = getSanoraUrl();
@@ -3293,7 +3505,7 @@ async function startServer(params) {
 
       const schedule = await getAppointmentSchedule(tenant, product);
       const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
-      const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
+      const agoraUrl = `${wikiOrigin}/plugin/agora/${tenant.uuid}`;
       const imageUrl = product.image ? `${getSanoraPublicUrl(req)}/images/${product.image}` : '';
 
       const price = product.price || 0;
@@ -3307,7 +3519,7 @@ async function startServer(params) {
         timezone:        schedule ? schedule.timezone : 'UTC',
         duration:        String(schedule ? schedule.duration : 60),
         proceedLabel:    price === 0 ? 'Confirm Booking →' : 'Continue to Payment →',
-        shoppeUrl,
+        agoraUrl,
         tenantUuid:      tenant.uuid,
         keywords:        extractKeywords(product),
         title_json:      JSON.stringify(product.title || title),
@@ -3316,16 +3528,16 @@ async function startServer(params) {
       res.set('Content-Type', 'text/html');
       res.send(html);
     } catch (err) {
-      console.error('[shoppe] appointment booking page error:', err);
+      console.error('[agora] appointment booking page error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
     }
   });
 
   // Available slots JSON for an appointment
-  app.get('/plugin/shoppe/:identifier/book/:title/slots', async (req, res) => {
+  app.get('/plugin/agora/:identifier/book/:title/slots', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
 
       const title = decodeURIComponent(req.params.title);
       const sanoraUrl = getSanoraUrl();
@@ -3342,16 +3554,16 @@ async function startServer(params) {
 
       res.json({ available, timezone: schedule.timezone, duration: schedule.duration });
     } catch (err) {
-      console.error('[shoppe] slots error:', err);
+      console.error('[agora] slots error:', err);
       res.status(500).json({ error: err.message });
     }
   });
 
   // Subscription sign-up / renew page
-  app.get('/plugin/shoppe/:identifier/subscribe/:title', async (req, res) => {
+  app.get('/plugin/agora/:identifier/subscribe/:title', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+      if (!tenant) return res.status(404).send('<h1>Agora not found</h1>');
 
       const title = decodeURIComponent(req.params.title);
       const sanoraUrl = getSanoraUrl();
@@ -3362,7 +3574,7 @@ async function startServer(params) {
 
       const tierInfo = await getTierInfo(tenant, product);
       const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
-      const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
+      const agoraUrl = `${wikiOrigin}/plugin/agora/${tenant.uuid}`;
       const imageUrl = product.image ? `${getSanoraPublicUrl(req)}/images/${product.image}` : '';
       const benefits = tierInfo && tierInfo.benefits
         ? tierInfo.benefits.map(b => `<li>${escHtml(b)}</li>`).join('')
@@ -3377,7 +3589,7 @@ async function startServer(params) {
         productId:       product.productId || '',
         benefits,
         renewalDays:     String(tierInfo ? (tierInfo.renewalDays || 30) : 30),
-        shoppeUrl,
+        agoraUrl,
         tenantUuid:      tenant.uuid,
         keywords:        extractKeywords(product),
         title_json:      JSON.stringify(product.title || title),
@@ -3386,16 +3598,16 @@ async function startServer(params) {
       res.set('Content-Type', 'text/html');
       res.send(html);
     } catch (err) {
-      console.error('[shoppe] subscribe page error:', err);
+      console.error('[agora] subscribe page error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
     }
   });
 
-  // Owner orders page — authenticated via signed URL from shoppe-sign.js
-  app.get('/plugin/shoppe/:uuid/orders', async (req, res) => {
+  // Owner orders page — authenticated via signed URL from agora-sign.js
+  app.get('/plugin/agora/:uuid/orders', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.uuid);
-      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+      if (!tenant) return res.status(404).send('<h1>Agora not found</h1>');
 
       const err = checkOwnerSignature(req, tenant);
       if (err) {
@@ -3409,16 +3621,16 @@ async function startServer(params) {
       res.set('Content-Type', 'text/html');
       res.send(generateOrdersHTML(tenant, orderData));
     } catch (err) {
-      console.error('[shoppe] orders page error:', err);
+      console.error('[agora] orders page error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
     }
   });
 
   // Owner payouts setup — validates owner sig, redirects to Stripe Connect Express onboarding
-  app.get('/plugin/shoppe/:uuid/payouts', async (req, res) => {
+  app.get('/plugin/agora/:uuid/payouts', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.uuid);
-      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+      if (!tenant) return res.status(404).send('<h1>Agora not found</h1>');
 
       const err = checkOwnerSignature(req, tenant);
       if (err) {
@@ -3431,7 +3643,7 @@ async function startServer(params) {
       if (!tenant.addieKeys) {
         return res.status(500).send(
           `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f0f12;color:#e0e0e0">` +
-          `<h2>Payment account not configured</h2><p>This shoppe has no Addie user. Re-register to get one.</p></body></html>`
+          `<h2>Payment account not configured</h2><p>This agora has no Addie user. Re-register to get one.</p></body></html>`
         );
       }
 
@@ -3441,7 +3653,7 @@ async function startServer(params) {
       const signature = signMessage(message, addieKeys.privateKey);
 
       const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
-      const returnUrl  = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}/payouts/return`;
+      const returnUrl  = `${wikiOrigin}/plugin/agora/${tenant.uuid}/payouts/return`;
 
       const resp = await fetch(`${getAddieUrl()}/user/${tenant.addieKeys.uuid}/processor/stripe/express`, {
         method: 'PUT',
@@ -3459,16 +3671,16 @@ async function startServer(params) {
 
       res.redirect(json.onboardingUrl);
     } catch (err) {
-      console.error('[shoppe] payouts error:', err);
+      console.error('[agora] payouts error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
     }
   });
 
   // Stripe Connect Express return page — no auth, Stripe redirects here after onboarding
-  app.get('/plugin/shoppe/:uuid/payouts/return', (req, res) => {
+  app.get('/plugin/agora/:uuid/payouts/return', (req, res) => {
     const tenant = getTenantByIdentifier(req.params.uuid);
-    const name     = tenant ? escHtml(tenant.name) : 'your shoppe';
-    const shoppeUrl = tenant ? `/plugin/shoppe/${tenant.uuid}` : '/';
+    const name     = tenant ? escHtml(tenant.name) : 'your agora';
+    const agoraUrl = tenant ? `/plugin/agora/${tenant.uuid}` : '/';
     res.set('Content-Type', 'text/html');
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -3492,28 +3704,28 @@ async function startServer(params) {
     <h1>Payouts connected!</h1>
     <p>Your Stripe account is now linked to <strong>${name}</strong>.</p>
     <p>Payments will be transferred to your account automatically after each sale.</p>
-    <a href="${escHtml(shoppeUrl)}">← Back to shoppe</a>
+    <a href="${escHtml(agoraUrl)}">← Back to agora</a>
   </div>
 </body>
 </html>`);
   });
 
   // Membership portal page
-  app.get('/plugin/shoppe/:identifier/membership', (req, res) => {
+  app.get('/plugin/agora/:identifier/membership', (req, res) => {
     const tenant = getTenantByIdentifier(req.params.identifier);
-    if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+    if (!tenant) return res.status(404).send('<h1>Agora not found</h1>');
     const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
-    const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
-    const html = fillTemplate(SUBSCRIPTION_MEMBERSHIP_TMPL, { shoppeUrl, tenantUuid: tenant.uuid });
+    const agoraUrl = `${wikiOrigin}/plugin/agora/${tenant.uuid}`;
+    const html = fillTemplate(SUBSCRIPTION_MEMBERSHIP_TMPL, { agoraUrl, tenantUuid: tenant.uuid });
     res.set('Content-Type', 'text/html');
     res.send(html);
   });
 
   // Check subscription status for all tiers — used by the membership portal
-  app.post('/plugin/shoppe/:identifier/membership/check', async (req, res) => {
+  app.post('/plugin/agora/:identifier/membership/check', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
 
       const { recoveryKey } = req.body;
       if (!recoveryKey) return res.status(400).json({ error: 'recoveryKey required' });
@@ -3522,7 +3734,7 @@ async function startServer(params) {
       const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
       const products = await productsResp.json();
       const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
-      const shoppeUrl = `${wikiOrigin}/plugin/shoppe/${tenant.uuid}`;
+      const agoraUrl = `${wikiOrigin}/plugin/agora/${tenant.uuid}`;
 
       const subscriptions = [];
       for (const [title, product] of Object.entries(products)) {
@@ -3552,13 +3764,13 @@ async function startServer(params) {
           daysLeft:           status.daysLeft  || 0,
           renewsAt:           status.renewsAt  || null,
           exclusiveArtifacts,
-          subscribeUrl:       `${shoppeUrl}/subscribe/${encodeURIComponent(product.title || title)}`
+          subscribeUrl:       `${agoraUrl}/subscribe/${encodeURIComponent(product.title || title)}`
         });
       }
 
       res.json({ subscriptions });
     } catch (err) {
-      console.error('[shoppe] membership check error:', err);
+      console.error('[agora] membership check error:', err);
       res.status(500).json({ error: err.message });
     }
   });
@@ -3566,17 +3778,17 @@ async function startServer(params) {
   // Purchase intent — creates buyer Addie user, returns Stripe client secret.
   // Digital products (recoveryKey): checks if already purchased first.
   // Physical products (no recoveryKey): generates an orderRef the client carries to purchase/complete.
-  app.post('/plugin/shoppe/:identifier/purchase/intent', async (req, res) => {
+  app.post('/plugin/agora/:identifier/purchase/intent', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
 
       const { recoveryKey, pubKey, timestamp: buyerTimestamp, signature: buyerSignature, productId, title, slotDatetime, payees: clientPayees,
               affiliatePubKey } = req.body;
       if (!productId) return res.status(400).json({ error: 'productId required' });
       if (!pubKey && !recoveryKey && !title) return res.status(400).json({ error: 'pubKey (with timestamp+signature) or recoveryKey required' });
 
-      // Shoppere app path: verify the buyer's Sessionless signature before proceeding
+      // Polites app path: verify the buyer's Sessionless signature before proceeding
       if (pubKey) {
         const sigErr = verifyBuyerSignature(pubKey, buyerTimestamp, buyerSignature);
         if (sigErr) return res.status(401).json({ error: sigErr });
@@ -3594,14 +3806,14 @@ async function startServer(params) {
       let orderRef;
 
       if (pubKey && product?.category === 'subscription') {
-        // Shoppere: subscription — check active status by pubKey orderKey
+        // Polites: subscription — check active status by pubKey orderKey
         const alreadyPurchased = await hasPurchasedByPubKey(tenant, pubKey, productId);
         if (alreadyPurchased) {
           return res.json({ alreadySubscribed: true });
         }
         buyer = await getOrCreateBuyerAddieUserByPubKey(pubKey, productId);
       } else if (pubKey && slotDatetime) {
-        // Shoppere: appointment — verify slot availability
+        // Polites: appointment — verify slot availability
         const schedule = await getAppointmentSchedule(tenant, product);
         if (schedule) {
           const bookedSlots = await getBookedSlots(tenant, productId);
@@ -3611,7 +3823,7 @@ async function startServer(params) {
         }
         buyer = await getOrCreateBuyerAddieUserByPubKey(pubKey, productId);
       } else if (pubKey) {
-        // Shoppere: digital product — check if already purchased by pubKey
+        // Polites: digital product — check if already purchased by pubKey
         const alreadyPurchased = await hasPurchasedByPubKey(tenant, pubKey, productId);
         if (alreadyPurchased) return res.json({ purchased: true });
         buyer = await getOrCreateBuyerAddieUserByPubKey(pubKey, productId);
@@ -3681,6 +3893,26 @@ async function startServer(params) {
           ? validatedPayees
           : tenant.addieKeys ? [{ pubKey: tenant.addieKeys.pubKey, amount }] : [];
       }
+
+      // Platform commission: if the server has a Stripe-connected Addie account,
+      // carve a small percentage from the tenant's share.
+      {
+        const serverConfig = loadConfig();
+        if (serverConfig.serverAddie && serverConfig.stripeOnboarded && tenant.addieKeys) {
+          const commission = serverConfig.serverCommission || 0.05;
+          const serverAmount = Math.floor(amount * commission);
+          if (serverAmount > 0) {
+            const tenantIdx = payees.findIndex(p => p.pubKey === tenant.addieKeys.pubKey);
+            if (tenantIdx >= 0 && payees[tenantIdx].amount - serverAmount > 0) {
+              payees = payees.map((p, i) =>
+                i === tenantIdx ? { ...p, amount: p.amount - serverAmount } : p
+              );
+              payees.push({ pubKey: serverConfig.serverAddie.pubKey, amount: serverAmount });
+            }
+          }
+        }
+      }
+
       const buyerKeys = { pubKey: buyer.pubKey, privateKey: buyer.privateKey };
       const intentTimestamp = Date.now().toString();
       const intentSignature = signMessage(intentTimestamp + buyer.uuid + amount + 'USD', buyerKeys.privateKey);
@@ -3697,7 +3929,7 @@ async function startServer(params) {
       if (orderRef) response.orderRef = orderRef;
       res.json(response);
     } catch (err) {
-      console.error('[shoppe] purchase intent error:', err);
+      console.error('[agora] purchase intent error:', err);
       res.status(500).json({ error: err.message });
     }
   });
@@ -3705,17 +3937,17 @@ async function startServer(params) {
   // Purchase complete — called after Stripe payment confirms.
   // Digital: creates a recovery hash in Sanora.
   // Physical: records the order (including shipping address) in Sanora, signed by the tenant.
-  //           Address is routed through the shoppe server so it never goes directly
+  //           Address is routed through the agora server so it never goes directly
   //           from the browser to Sanora. It is only stored after payment succeeds.
-  app.post('/plugin/shoppe/:identifier/purchase/complete', async (req, res) => {
+  app.post('/plugin/agora/:identifier/purchase/complete', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
 
       const { recoveryKey, pubKey, timestamp: buyerTimestamp, signature: buyerSignature, productId, orderRef, address, title, amount, slotDatetime, contactInfo, type, renewalDays, paymentIntentId } = req.body;
       const sanoraUrlInternal = getSanoraUrl();
 
-      // Verify Shoppere signature if pubKey path
+      // Verify Polites signature if pubKey path
       if (pubKey) {
         const sigErr = verifyBuyerSignature(pubKey, buyerTimestamp, buyerSignature);
         if (sigErr) return res.status(401).json({ error: sigErr });
@@ -3727,13 +3959,13 @@ async function startServer(params) {
         fetch(`${getAddieUrl()}/payment/${encodeURIComponent(paymentIntentId)}/process-transfers`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' }
-        }).catch(err => console.warn('[shoppe] transfer trigger failed:', err.message));
+        }).catch(err => console.warn('[agora] transfer trigger failed:', err.message));
       }
 
-      // ── Shoppere app (pubKey) paths ───────────────────────────────────────
+      // ── Polites app (pubKey) paths ───────────────────────────────────────
 
       if (pubKey && type === 'subscription') {
-        // Shoppere subscription: orderKey = sha256(pubKey + productId)
+        // Polites subscription: orderKey = sha256(pubKey + productId)
         const orderKey = crypto.createHash('sha256').update(pubKey + productId).digest('hex');
         const tenantKeys = tenant.keys;
         const ts  = Date.now().toString();
@@ -3749,7 +3981,7 @@ async function startServer(params) {
       }
 
       if (pubKey && slotDatetime) {
-        // Shoppere appointment: record booking with pubKey credential
+        // Polites appointment: record booking with pubKey credential
         const orderKey = crypto.createHash('sha256').update(pubKey + productId).digest('hex');
         const tenantKeys = tenant.keys;
         const bookingTimestamp = Date.now().toString();
@@ -3773,7 +4005,7 @@ async function startServer(params) {
       }
 
       if (pubKey) {
-        // Shoppere digital product: record purchase with pubKey as credential
+        // Polites digital product: record purchase with pubKey as credential
         const orderKey = crypto.createHash('sha256').update(pubKey + productId).digest('hex');
         const tenantKeys = tenant.keys;
         const ts  = Date.now().toString();
@@ -3785,13 +4017,13 @@ async function startServer(params) {
           body: JSON.stringify({ timestamp: ts, signature: sig, order })
         });
         triggerTransfer();
-        // Return a download URL for digital goods so the Shoppere app can open the content
+        // Return a download URL for digital goods so the Polites app can open the content
         const sanoraUrl = getSanoraUrl();
         const products = await fetchWithRetry(`${sanoraUrl}/products/${tenant.uuid}`).then(r => r.ok ? r.json() : {});
         const product = Object.values(products).find(p => p.uuid === productId || p.title === title);
         let downloadUrl = null;
         if (product && ['book', 'post', 'video'].includes(product.category)) {
-          downloadUrl = `https://${req.get('host')}/plugin/shoppe/${tenant.uuid}/download/${encodeURIComponent(product.title)}`;
+          downloadUrl = `https://${req.get('host')}/plugin/agora/${tenant.uuid}/download/${encodeURIComponent(product.title)}`;
         }
         return res.json({ success: true, downloadUrl });
       }
@@ -3883,17 +4115,17 @@ async function startServer(params) {
 
       res.status(400).json({ error: 'recoveryKey or (orderRef + address) required' });
     } catch (err) {
-      console.error('[shoppe] purchase complete error:', err);
+      console.error('[agora] purchase complete error:', err);
       res.status(500).json({ error: err.message });
     }
   });
 
   // ── Stripe Terminal routes ─────────────────────────────────────────────────
 
-  app.get('/plugin/shoppe/:identifier/terminal/connection-token', async (req, res) => {
+  app.get('/plugin/agora/:identifier/terminal/connection-token', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
       const stripe = getStripe();
       const token = await stripe.terminal.connectionTokens.create();
       res.json({ secret: token.secret });
@@ -3903,10 +4135,10 @@ async function startServer(params) {
     }
   });
 
-  app.post('/plugin/shoppe/:identifier/terminal/payment-intent', async (req, res) => {
+  app.post('/plugin/agora/:identifier/terminal/payment-intent', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
 
       const { amount, currency = 'usd', productId, productTitle, affiliatePubKey } = req.body;
       if (!amount || amount <= 0) return res.status(400).json({ error: 'amount required' });
@@ -3917,7 +4149,7 @@ async function startServer(params) {
         currency,
         payment_method_types: ['card_present'],
         capture_method: 'manual',
-        description: productTitle || 'Shoppere charge',
+        description: productTitle || 'Polites charge',
         metadata: {
           shopId:          tenant.uuid,
           productId:       productId       || '',
@@ -3927,15 +4159,15 @@ async function startServer(params) {
 
       res.json({ paymentIntentId: paymentIntent.id, clientSecret: paymentIntent.client_secret });
     } catch (err) {
-      console.error('[shoppe] terminal payment-intent error:', err);
+      console.error('[agora] terminal payment-intent error:', err);
       res.status(500).json({ error: err.message });
     }
   });
 
-  app.post('/plugin/shoppe/:identifier/terminal/capture', async (req, res) => {
+  app.post('/plugin/agora/:identifier/terminal/capture', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
 
       const { paymentIntentId, productId, productTitle, buyerInfo } = req.body;
       if (!paymentIntentId) return res.status(400).json({ error: 'paymentIntentId required' });
@@ -3959,7 +4191,7 @@ async function startServer(params) {
 
       if (tenant.stripeAccountId && tenantAmount > 0) {
         stripe.transfers.create({ amount: tenantAmount, currency: 'usd', destination: tenant.stripeAccountId, ...transferBase })
-          .catch(e => console.warn('[shoppe] tenant transfer failed:', e.message));
+          .catch(e => console.warn('[agora] tenant transfer failed:', e.message));
       }
 
       if (affiliatePubKey) {
@@ -3967,7 +4199,7 @@ async function startServer(params) {
         const aff = affiliates[affiliatePubKey];
         if (aff?.stripeAccountId && affiliateAmount > 0) {
           stripe.transfers.create({ amount: affiliateAmount, currency: 'usd', destination: aff.stripeAccountId, ...transferBase })
-            .catch(e => console.warn('[shoppe] affiliate transfer failed:', e.message));
+            .catch(e => console.warn('[agora] affiliate transfer failed:', e.message));
         }
       }
 
@@ -3994,17 +4226,17 @@ async function startServer(params) {
 
       res.json({ success: true, amount, affiliateAmount, tenantAmount });
     } catch (err) {
-      console.error('[shoppe] terminal capture error:', err);
+      console.error('[agora] terminal capture error:', err);
       res.status(500).json({ error: err.message });
     }
   });
 
   // Called after Stripe Connect onboarding to link a Stripe account to the tenant or affiliate.
   // body: { type: 'tenant' | 'affiliate', stripeAccountId, pubKey? (for affiliate) }
-  app.post('/plugin/shoppe/:identifier/terminal/stripe-account', async (req, res) => {
+  app.post('/plugin/agora/:identifier/terminal/stripe-account', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
 
       const { type, stripeAccountId, pubKey } = req.body;
       if (!stripeAccountId) return res.status(400).json({ error: 'stripeAccountId required' });
@@ -4031,10 +4263,10 @@ async function startServer(params) {
   });
 
   // Ebook download page (reached after successful payment + hash creation)
-  app.get('/plugin/shoppe/:identifier/download/:title', async (req, res) => {
+  app.get('/plugin/agora/:identifier/download/:title', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+      if (!tenant) return res.status(404).send('<h1>Agora not found</h1>');
 
       const title = decodeURIComponent(req.params.title);
       const { pubKey, timestamp: buyerTimestamp, signature: buyerSignature } = req.query;
@@ -4044,7 +4276,7 @@ async function startServer(params) {
       const product = products[title] || Object.values(products).find(p => p.title === title);
       if (!product) return res.status(404).send('<h1>Book not found</h1>');
 
-      // Verify access credential — either a valid Shoppere pubKey signature
+      // Verify access credential — either a valid Polites pubKey signature
       // with a matching purchase record, or the legacy recovery hash (checked client-side
       // in the download template itself via the existing hash endpoints).
       if (pubKey) {
@@ -4080,16 +4312,16 @@ async function startServer(params) {
       res.set('Content-Type', 'text/html');
       res.send(html);
     } catch (err) {
-      console.error('[shoppe] download page error:', err);
+      console.error('[agora] download page error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
     }
   });
 
   // Post reader — fetches markdown from Sanora and renders it as HTML
-  app.get('/plugin/shoppe/:identifier/post/:title', async (req, res) => {
+  app.get('/plugin/agora/:identifier/post/:title', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
+      if (!tenant) return res.status(404).send('<h1>Agora not found</h1>');
 
       const title = decodeURIComponent(req.params.title);
       const productsResp = await fetch(`${getSanoraUrl()}/products/${tenant.uuid}`);
@@ -4113,16 +4345,16 @@ async function startServer(params) {
       res.set('Content-Type', 'text/html');
       res.send(generatePostHTML(tenant, postTitle, postDate, imageUrl, fm.body || mdContent));
     } catch (err) {
-      console.error('[shoppe] post page error:', err);
+      console.error('[agora] post page error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
     }
   });
 
-  // GET /plugin/shoppe/:id/video/:title/upload-info
+  // GET /plugin/agora/:id/video/:title/upload-info
   // Returns a pre-signed lucille upload URL so the browser can PUT the video file directly to lucille.
-  // Auth: shoppe tenant owner signature (timestamp + uuid), valid for 24 hours.
-  // Generate the signed URL with: node shoppe-sign.js upload
-  app.get('/plugin/shoppe/:identifier/video/:title/upload-info', async (req, res) => {
+  // Auth: agora tenant owner signature (timestamp + uuid), valid for 24 hours.
+  // Generate the signed URL with: node agora-sign.js upload
+  app.get('/plugin/agora/:identifier/video/:title/upload-info', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
       if (!tenant) return res.status(404).json({ error: 'tenant not found' });
@@ -4146,13 +4378,13 @@ async function startServer(params) {
     }
   });
 
-  // Shoppere app: purchases for a pubKey across all products on this shoppe.
+  // Polites app: purchases for a pubKey across all products on this agora.
   // Auth: pubKey + timestamp + signature (Sessionless, 5-min TTL)
   // Returns the subset of Sanora orders whose orderKey === sha256(pubKey + productId).
-  app.get('/plugin/shoppe/:identifier/purchases', async (req, res) => {
+  app.get('/plugin/agora/:identifier/purchases', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
 
       const { pubKey, timestamp, signature } = req.query;
       const sigErr = verifyBuyerSignature(pubKey, timestamp, signature);
@@ -4190,7 +4422,7 @@ async function startServer(params) {
               slot:         match.slot || null,
               renewalDays:  match.renewalDays || null,
               downloadUrl:  ['book', 'post', 'video'].includes(product.category)
-                ? `${reqProto(req)}://${req.get('host')}/plugin/shoppe/${tenant.uuid}/download/${encodeURIComponent(product.title)}`
+                ? `${reqProto(req)}://${req.get('host')}/plugin/agora/${tenant.uuid}/download/${encodeURIComponent(product.title)}`
                 : null,
             });
           }
@@ -4199,17 +4431,17 @@ async function startServer(params) {
 
       res.json({ success: true, shopName: tenant.name, purchases });
     } catch (err) {
-      console.error('[shoppe] purchases error:', err);
+      console.error('[agora] purchases error:', err);
       res.status(500).json({ error: err.message });
     }
   });
 
   // Goods JSON (public)
-  app.get('/plugin/shoppe/:identifier/goods', async (req, res) => {
+  app.get('/plugin/agora/:identifier/goods', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
-      const goods = await getShoppeGoods(tenant, getSanoraPublicUrl(req));
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
+      const goods = await getAgoraGoods(tenant, getSanoraPublicUrl(req));
       const cat = req.query.category;
       res.json({ success: true, goods: (cat && goods[cat]) ? goods[cat] : goods });
     } catch (err) {
@@ -4218,10 +4450,10 @@ async function startServer(params) {
   });
 
   // Music feed — builds { albums, tracks } from Sanora products directly
-  app.get('/plugin/shoppe/:identifier/music/feed', async (req, res) => {
+  app.get('/plugin/agora/:identifier/music/feed', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).json({ error: 'Shoppe not found' });
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
       const sanoraUrl = getSanoraUrl();
       const productsResp = await fetchWithRetry(`${sanoraUrl}/products/${tenant.uuid}`, { timeout: 15000 });
       if (!productsResp.ok) return res.status(502).json({ error: 'Could not load products' });
@@ -4260,12 +4492,12 @@ async function startServer(params) {
     }
   });
 
-  // Shoppe HTML page (public)
-  app.get('/plugin/shoppe/:identifier', async (req, res) => {
+  // Agora HTML page (public)
+  app.get('/plugin/agora/:identifier', async (req, res) => {
     try {
       const tenant = getTenantByIdentifier(req.params.identifier);
-      if (!tenant) return res.status(404).send('<h1>Shoppe not found</h1>');
-      const goods = await getShoppeGoods(tenant, getSanoraPublicUrl(req));
+      if (!tenant) return res.status(404).send('<h1>Agora not found</h1>');
+      const goods = await getAgoraGoods(tenant, getSanoraPublicUrl(req));
 
       // Check if the request carries a valid owner signature — if so, embed auth
       // params in the page so the upload button can authenticate with upload-info.
@@ -4273,19 +4505,19 @@ async function startServer(params) {
       const uploadAuth = sigErr ? null : { timestamp: req.query.timestamp, signature: req.query.signature };
 
       res.set('Content-Type', 'text/html');
-      res.send(generateShoppeHTML(tenant, goods, uploadAuth));
+      res.send(generateAgoraHTML(tenant, goods, uploadAuth));
     } catch (err) {
-      console.error('[shoppe] page error:', err);
+      console.error('[agora] page error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
     }
   });
 
-  console.log('✅ wiki-plugin-shoppe ready!');
-  console.log('   POST /plugin/shoppe/register        — register tenant (owner)');
-  console.log('   GET  /plugin/shoppe/tenants         — list tenants (owner)');
-  console.log('   POST /plugin/shoppe/upload          — upload goods archive');
-  console.log('   GET  /plugin/shoppe/:id             — shoppe page');
-  console.log('   GET  /plugin/shoppe/:id/goods       — goods JSON');
+  console.log('✅ wiki-plugin-agora ready!');
+  console.log('   POST /plugin/agora/register        — register tenant (owner)');
+  console.log('   GET  /plugin/agora/tenants         — list tenants (owner)');
+  console.log('   POST /plugin/agora/upload          — upload goods archive');
+  console.log('   GET  /plugin/agora/:id             — agora page');
+  console.log('   GET  /plugin/agora/:id/goods       — goods JSON');
 }
 
 module.exports = { startServer };

@@ -145,7 +145,7 @@
           Open <strong>Shoppere</strong> to access <em>{{title}}</em>.<br>
           Your purchase is saved to your shop credential.
         </div>
-        <a class="success-back" href="{{shoppeUrl}}">← Back to shoppe</a>
+        <a class="success-back" href="{{agoraUrl}}">← Back to agora</a>
       </div>
     </div>
   </div>
@@ -219,7 +219,7 @@
 
     // Call purchase/intent immediately — credentials are already verified
     try {
-      const resp = await fetch('/plugin/shoppe/{{tenantUuid}}/purchase/intent', {
+      const resp = await fetch('/plugin/agora/{{tenantUuid}}/purchase/intent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -286,7 +286,7 @@
 
   async function completeShopperePurchase(paymentIntentId) {
     try {
-      const resp = await fetch('/plugin/shoppe/{{tenantUuid}}/purchase/complete', {
+      const resp = await fetch('/plugin/agora/{{tenantUuid}}/purchase/complete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -547,7 +547,7 @@
     const recoveryKey = formData.Recovery;
 
     try {
-      const resp = await fetch('/plugin/shoppe/{{tenantUuid}}/purchase/intent', {
+      const resp = await fetch('/plugin/agora/{{tenantUuid}}/purchase/intent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -588,13 +588,13 @@
     try {
       const { error } = await stripe.confirmPayment({
         elements,
-        confirmParams: { return_url: '{{shoppeUrl}}' },
+        confirmParams: { return_url: '{{agoraUrl}}' },
         redirect: 'if_required'
       });
       if (error) { showError(error.message); return; }
 
       const paymentIntentId = window.clientSecret?.split('_secret_')[0];
-      const resp = await fetch('/plugin/shoppe/{{tenantUuid}}/purchase/complete', {
+      const resp = await fetch('/plugin/agora/{{tenantUuid}}/purchase/complete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -1,11 +1,11 @@
 {
-  "name": "wiki-plugin-shoppe",
-  "version": "0.0.46",
-  "description": "Multi-tenant digital goods shoppe for federated wiki, powered by Sanora",
+  "name": "wiki-plugin-agora",
+  "version": "0.0.49",
+  "description": "Multi-tenant digital goods agora for federated wiki, powered by Sanora",
   "keywords": [
     "wiki",
     "federated",
-    "shoppe",
+    "agora",
     "storefront",
     "planet-nine",
     "sanora"

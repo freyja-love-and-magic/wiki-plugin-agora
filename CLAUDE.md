@@ -1,6 +1,6 @@
-# wiki-plugin-shoppe — Developer Documentation
+# wiki-plugin-agora — Developer Documentation
 
-Multi-tenant digital goods shoppe for Federated Wiki, powered by Sanora.
+Multi-tenant digital goods agora for Federated Wiki, powered by Sanora.
 
 **Current version**: 0.0.43
 
@@ -14,35 +14,35 @@ Each tenant has:
 - **UUID** — their Sanora user UUID
 - **Emojicode** — 8-emoji human-readable identifier (e.g. `🛍️🎨🎁🌟💎🐉📚🔥`)
 
-The first 3 emoji are fixed per wiki instance (`SHOPPE_BASE_EMOJI`, default `🛍️🎨🎁`). The last 5 are unique per tenant.
+The first 3 emoji are fixed per wiki instance (`AGORA_BASE_EMOJI`, default `🛍️🎨🎁`). The last 5 are unique per tenant.
 
 ### Tenant Lifecycle
 
-1. Wiki owner registers a tenant: `POST /plugin/shoppe/register { name }`
+1. Wiki owner registers a tenant: `POST /plugin/agora/register { name }`
    - Plugin creates a Sanora user + an Addie user for the tenant
    - Generates emojicode + owner keypair (secp256k1 via sessionless)
-   - Stores `{ uuid, emojicode, name, keys, addieKeys, ownerPubKey }` in `~/.shoppe/tenants.json`
+   - Stores `{ uuid, emojicode, name, keys, addieKeys, ownerPubKey }` in `~/.agora/tenants.json`
    - Owner private key is delivered once via a single-use starter bundle download (bundleToken)
-2. Tenant runs `node shoppe-sign.js init` — moves private key to `~/.shoppe/keys/<uuid>.json`
-3. Tenant runs `node shoppe-sign.js payouts` — completes Stripe Connect Express onboarding
-4. Tenant builds their archive and runs `node shoppe-sign.js` to sign and zip
+2. Tenant runs `node agora-sign.js init` — moves private key to `~/.agora/keys/<uuid>.json`
+3. Tenant runs `node agora-sign.js payouts` — completes Stripe Connect Express onboarding
+4. Tenant builds their archive and runs `node agora-sign.js` to sign and zip
 5. Tenant drags the zip onto the wiki plugin widget
 6. Plugin verifies `uuid + emojicode + owner signature`, processes all goods into Sanora
-7. Shoppe accessible at `/plugin/shoppe/:uuid` or `/plugin/shoppe/:emojicode`
+7. Agora accessible at `/plugin/agora/:uuid` or `/plugin/agora/:emojicode`
 
-### shoppe-sign.js commands
+### agora-sign.js commands
 
 | Command | Description |
 |---------|-------------|
-| `node shoppe-sign.js init` | Move `shoppe-key.json` to `~/.shoppe/keys/<uuid>.json` (no npm needed) |
-| `node shoppe-sign.js` | Sign manifest + create upload.zip |
-| `node shoppe-sign.js orders [wiki-url]` | Generate signed orders URL (5-min expiry), open in browser |
-| `node shoppe-sign.js payouts [wiki-url]` | Generate signed payouts URL, redirect to Stripe Connect onboarding |
+| `node agora-sign.js init` | Move `agora-key.json` to `~/.agora/keys/<uuid>.json` (no npm needed) |
+| `node agora-sign.js` | Sign manifest + create upload.zip |
+| `node agora-sign.js orders [wiki-url]` | Generate signed orders URL (5-min expiry), open in browser |
+| `node agora-sign.js payouts [wiki-url]` | Generate signed payouts URL, redirect to Stripe Connect onboarding |
 
 ## Archive Format
 
 ```
-my-shoppe.zip
+my-agora.zip
   manifest.json           ← required: { uuid, emojicode, name }
   books/
     My Novel/             ← subfolder per book
@@ -100,7 +100,7 @@ my-shoppe.zip
 {
   "uuid": "your-uuid-from-registration",
   "emojicode": "🛍️🎨🎁🌟💎🐉📚🔥",
-  "name": "My Shoppe",
+  "name": "My Agora",
   "keywords": ["digital goods", "indie creator", "music", "books"],
   "lightMode": false
 }
@@ -110,7 +110,7 @@ my-shoppe.zip
 
 `redirects` is optional. Each key is a content category and the value is an external URL. Clicking any card in that category sends visitors to that URL instead of the plugin's built-in pages.
 
-`lightMode` is optional (default `false`). When `true`, the shoppe page uses light mode styling (white cards, `#f5f5f7` background, `#0066cc` accent). Default is dark mode (`#0f0f12` background, `#7ec8e3` accent). Stored in `tenants.json` and applied on every page load — no re-upload needed once set.
+`lightMode` is optional (default `false`). When `true`, the agora page uses light mode styling (white cards, `#f5f5f7` background, `#0066cc` accent). Default is dark mode (`#0f0f12` background, `#7ec8e3` accent). Stored in `tenants.json` and applied on every page load — no re-upload needed once set.
 
 ### books/*/info.json
 
@@ -219,36 +219,36 @@ The hero image is resolved automatically: `hero.jpg` or `hero.png` is used if pr
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `POST` | `/plugin/shoppe/register` | Owner | Register new tenant |
-| `GET`  | `/plugin/shoppe/tenants` | Owner | List all tenants |
-| `POST` | `/plugin/shoppe/upload` | UUID+emojicode in archive | Upload goods archive (returns `{ jobId }` immediately) |
-| `GET`  | `/plugin/shoppe/upload/progress/:jobId` | Public | SSE stream of upload progress events |
-| `GET`  | `/plugin/shoppe/:id` | Public | Shoppe HTML page |
-| `GET`  | `/plugin/shoppe/:id/goods` | Public | Goods JSON |
-| `GET`  | `/plugin/shoppe/:id/goods?category=books` | Public | Filtered goods JSON |
-| `GET`  | `/plugin/shoppe/:id/music/feed` | Public | Music feed `{ albums, tracks }` built from Sanora products |
-| `GET`  | `/plugin/shoppe/:id/book/:title` | Public | Appointment booking page (standalone) |
-| `GET`  | `/plugin/shoppe/:id/book/:title/slots` | Public | Available slots JSON |
-| `GET`  | `/plugin/shoppe/:id/subscribe/:title` | Public | Subscription sign-up page (standalone) |
-| `GET`  | `/plugin/shoppe/:id/membership` | Public | Membership portal |
-| `POST` | `/plugin/shoppe/:id/membership/check` | Public | Check subscription status |
-| `POST` | `/plugin/shoppe/:id/purchase/intent` | Public | Create Stripe payment intent |
-| `POST` | `/plugin/shoppe/:id/purchase/complete` | Public | Record completed purchase |
-| `GET`  | `/plugin/shoppe/:id/download/:title` | Public | Ebook download page |
-| `GET`  | `/plugin/shoppe/:id/post/:title` | Public | Post reader |
-| `GET`  | `/plugin/shoppe/:id/orders` | Owner (signed URL) | Order history page |
-| `GET`  | `/plugin/shoppe/:id/payouts` | Owner (signed URL) | Stripe Connect Express onboarding |
-| `GET`  | `/plugin/shoppe/:id/payouts/return` | Public | Post-Stripe-Connect confirmation page |
+| `POST` | `/plugin/agora/register` | Owner | Register new tenant |
+| `GET`  | `/plugin/agora/tenants` | Owner | List all tenants |
+| `POST` | `/plugin/agora/upload` | UUID+emojicode in archive | Upload goods archive (returns `{ jobId }` immediately) |
+| `GET`  | `/plugin/agora/upload/progress/:jobId` | Public | SSE stream of upload progress events |
+| `GET`  | `/plugin/agora/:id` | Public | Agora HTML page |
+| `GET`  | `/plugin/agora/:id/goods` | Public | Goods JSON |
+| `GET`  | `/plugin/agora/:id/goods?category=books` | Public | Filtered goods JSON |
+| `GET`  | `/plugin/agora/:id/music/feed` | Public | Music feed `{ albums, tracks }` built from Sanora products |
+| `GET`  | `/plugin/agora/:id/book/:title` | Public | Appointment booking page (standalone) |
+| `GET`  | `/plugin/agora/:id/book/:title/slots` | Public | Available slots JSON |
+| `GET`  | `/plugin/agora/:id/subscribe/:title` | Public | Subscription sign-up page (standalone) |
+| `GET`  | `/plugin/agora/:id/membership` | Public | Membership portal |
+| `POST` | `/plugin/agora/:id/membership/check` | Public | Check subscription status |
+| `POST` | `/plugin/agora/:id/purchase/intent` | Public | Create Stripe payment intent |
+| `POST` | `/plugin/agora/:id/purchase/complete` | Public | Record completed purchase |
+| `GET`  | `/plugin/agora/:id/download/:title` | Public | Ebook download page |
+| `GET`  | `/plugin/agora/:id/post/:title` | Public | Post reader |
+| `GET`  | `/plugin/agora/:id/orders` | Owner (signed URL) | Order history page |
+| `GET`  | `/plugin/agora/:id/payouts` | Owner (signed URL) | Stripe Connect Express onboarding |
+| `GET`  | `/plugin/agora/:id/payouts/return` | Public | Post-Stripe-Connect confirmation page |
 
 `:id` accepts either UUID or emojicode.
 
 ## Upload Flow (SSE Progress)
 
-The upload endpoint is non-blocking. The client POSTs the archive and immediately gets `{ jobId }`. It then opens an `EventSource` to `/plugin/shoppe/upload/progress/:jobId` and receives a stream of events:
+The upload endpoint is non-blocking. The client POSTs the archive and immediately gets `{ jobId }`. It then opens an `EventSource` to `/plugin/agora/upload/progress/:jobId` and receives a stream of events:
 
 | Event | Data |
 |-------|------|
-| `start` | `{ total, name }` — total item count and shoppe name |
+| `start` | `{ total, name }` — total item count and agora name |
 | `progress` | `{ current, total, label }` — item number and human-readable label |
 | `warning` | `{ message }` — non-fatal issue (e.g. image upload failed) |
 | `complete` | `{ success, books, music, posts, … }` — final result counts |
@@ -256,9 +256,9 @@ The upload endpoint is non-blocking. The client POSTs the archive and immediatel
 
 The progress stream is buffered for late-connecting clients. Jobs are cleaned up after 15 minutes.
 
-## Shoppe Page UI
+## Agora Page UI
 
-The shoppe page is a single-page app generated server-side by `generateShoppeHTML`. All tabs are lazy-initialized on first open.
+The agora page is a single-page app generated server-side by `generateAgoraHTML`. All tabs are lazy-initialized on first open.
 
 ### Tabs and their UI patterns
 
@@ -282,15 +282,15 @@ The player bar is fixed at the bottom of the page and is always dark regardless 
 
 ### Posts Hierarchy
 
-Post series are detected server-side by `category: 'post-series'` products. Parts are linked by `series:SeriesTitle` and `part:N` tags. The hierarchy is pre-computed in `generateShoppeHTML` and embedded as `_postsRaw` JSON so the client does no extra fetching.
+Post series are detected server-side by `category: 'post-series'` products. Parts are linked by `series:SeriesTitle` and `part:N` tags. The hierarchy is pre-computed in `generateAgoraHTML` and embedded as `_postsRaw` JSON so the client does no extra fetching.
 
 ### Inline Subscriptions and Appointments
 
-Subscriptions and appointments are fully handled inline on the shoppe page — no navigation to separate pages. The full payment flow (recovery key → Stripe Elements → confirmation) runs inside expanding panels under each tier/appointment card. Data (`productId`, `renewalDays`, `benefits`, `timezone`, `duration`) is fetched from Sanora artifact JSON during `getShoppeGoods` and embedded in the page.
+Subscriptions and appointments are fully handled inline on the agora page — no navigation to separate pages. The full payment flow (recovery key → Stripe Elements → confirmation) runs inside expanding panels under each tier/appointment card. Data (`productId`, `renewalDays`, `benefits`, `timezone`, `duration`) is fetched from Sanora artifact JSON during `getAgoraGoods` and embedded in the page.
 
 ## Theming
 
-The shoppe page is **dark mode by default**. All colors use CSS custom properties defined in `:root`:
+The agora page is **dark mode by default**. All colors use CSS custom properties defined in `:root`:
 
 | Variable | Dark | Light |
 |----------|------|-------|
@@ -300,7 +300,7 @@ The shoppe page is **dark mode by default**. All colors use CSS custom propertie
 | `--text` | `#e8e8ea` | `#1d1d1f` |
 | `--border` | `#333` | `#ddd` |
 
-Set `"lightMode": true` in `manifest.json` and re-upload to switch a shoppe to light mode. The flag is stored in `tenants.json` so it persists across re-uploads. The music player bar is always dark in both modes.
+Set `"lightMode": true` in `manifest.json` and re-upload to switch an agora to light mode. The flag is stored in `tenants.json` so it persists across re-uploads. The music player bar is always dark in both modes.
 
 ## UUID Alias / Redis Reset Recovery
 
@@ -310,7 +310,7 @@ If Sanora's Redis is cleared, the tenant's UUID changes on the next `sanoraEnsur
 2. `getTenantByIdentifier` follows string values as aliases
 3. All subsequent uploads and page loads use the new UUID transparently
 
-If you encounter `Unknown UUID` errors after a Redis reset, manually add `"old-uuid": "new-uuid"` to `~/.shoppe/tenants.json`.
+If you encounter `Unknown UUID` errors after a Redis reset, manually add `"old-uuid": "new-uuid"` to `~/.agora/tenants.json`.
 
 ## Resilience Features
 
@@ -320,18 +320,18 @@ If you encounter `Unknown UUID` errors after a Redis reset, manually add `"old-u
 
 ## Payment / Transfer Flow
 
-1. Buyer calls `POST /purchase/intent` → shoppe creates a buyer Addie user and calls `PUT /user/:buyerUuid/processor/stripe/intent` on Addie → returns `{ clientSecret, publishableKey }`
+1. Buyer calls `POST /purchase/intent` → agora creates a buyer Addie user and calls `PUT /user/:buyerUuid/processor/stripe/intent` on Addie → returns `{ clientSecret, publishableKey }`
 2. Stripe.js confirms payment client-side (no redirect)
 3. Client extracts `paymentIntentId` from `clientSecret` (`clientSecret.split('_secret_')[0]`) and posts to `POST /purchase/complete` with `paymentIntentId`
 4. Server records the order in Sanora, then fires a **fire-and-forget** `POST ${addieUrl}/payment/${paymentIntentId}/process-transfers` — Addie splits the payment and routes it to the tenant's Stripe account
 
-**Important:** Transfers only flow to the owner after `node shoppe-sign.js payouts` has been run and Stripe Connect onboarding is complete.
+**Important:** Transfers only flow to the owner after `node agora-sign.js payouts` has been run and Stripe Connect onboarding is complete.
 
 ## Configuration
 
 ```bash
 # Base emoji for all tenant emojicodes on this wiki (default: 🛍️🎨🎁)
-export SHOPPE_BASE_EMOJI="🏪🎪🎁"
+export AGORA_BASE_EMOJI="🏪🎪🎁"
 
 # Sanora port (default: 7243)
 export SANORA_PORT=7243
@@ -359,9 +359,9 @@ Without this, epub/audio artifact uploads and large cover images will fail with 
 
 ## Storage
 
-- `~/.shoppe/tenants.json` — tenant registry (private keys + UUID aliases — gitignored)
-- `~/.shoppe/buyers.json` — buyer Addie keys, keyed by `recoveryKey + productId`
-- `~/.shoppe/config.json` — plugin config (sanoraUrl)
+- `~/.agora/tenants.json` — tenant registry (private keys + UUID aliases — gitignored)
+- `~/.agora/buyers.json` — buyer Addie keys, keyed by `recoveryKey + productId`
+- `~/.agora/config.json` — plugin config (sanoraUrl)
 
 Each tenant's goods are stored in Sanora under their own UUID.
 

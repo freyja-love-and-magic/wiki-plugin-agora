@@ -174,7 +174,7 @@
       <p>{{title}}</p>
       <p style="margin-top:16px;">A confirmation has been sent to the service provider.</p>
       <p style="margin-top:8px; font-size:13px; color:#666;">Keep your recovery key safe — you can use it to look up this booking.</p>
-      <button class="btn-outline" style="margin-top:24px; max-width:200px;" onclick="window.location.href='{{shoppeUrl}}'">← Back to Shoppe</button>
+      <button class="btn-outline" style="margin-top:24px; max-width:200px;" onclick="window.location.href='{{agoraUrl}}'">← Back to Agora</button>
     </div>
 
   </div>
@@ -184,7 +184,7 @@
 (function() {
   'use strict';
 
-  const SHOPPE_URL   = '{{shoppeUrl}}';
+  const AGORA_URL   = '{{agoraUrl}}';
   const PRODUCT_ID   = '{{productId}}';
   const TITLE        = {{title_json}};
   const AMOUNT       = {{amount}};
@@ -216,7 +216,7 @@
 
   async function loadSlots() {
     try {
-      const resp = await fetch(`${SHOPPE_URL}/book/${encodeURIComponent(TITLE)}/slots`);
+      const resp = await fetch(`${AGORA_URL}/book/${encodeURIComponent(TITLE)}/slots`);
       const data = await resp.json();
       document.getElementById('loading-slots').style.display = 'none';
 
@@ -342,7 +342,7 @@
     document.getElementById('proceed-to-pay').disabled = true;
 
     try {
-      const resp = await fetch(`${SHOPPE_URL}/purchase/intent`, {
+      const resp = await fetch(`${AGORA_URL}/purchase/intent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ recoveryKey, productId: PRODUCT_ID, title: TITLE, slotDatetime: selectedSlot,
@@ -363,7 +363,7 @@
           email: document.getElementById('contact-email').value.trim(),
           phone: document.getElementById('contact-phone').value.trim()
         };
-        await fetch(`${SHOPPE_URL}/purchase/complete`, {
+        await fetch(`${AGORA_URL}/purchase/complete`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ recoveryKey, productId: PRODUCT_ID, title: TITLE, slotDatetime: selectedSlot, contactInfo })
@@ -406,7 +406,7 @@
     try {
       const { error } = await stripe.confirmPayment({
         elements,
-        confirmParams: { return_url: SHOPPE_URL },
+        confirmParams: { return_url: AGORA_URL },
         redirect: 'if_required'
       });
 
@@ -427,7 +427,7 @@
       };
       const paymentIntentId = window.clientSecret ? window.clientSecret.split('_secret_')[0] : undefined;
 
-      await fetch(`${SHOPPE_URL}/purchase/complete`, {
+      await fetch(`${AGORA_URL}/purchase/complete`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

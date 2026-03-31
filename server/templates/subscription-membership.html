@@ -98,7 +98,7 @@
     </div>
 
     <div class="back-link">
-      <a href="{{shoppeUrl}}">← Back to shoppe</a>
+      <a href="{{agoraUrl}}">← Back to agora</a>
     </div>
 
   </div>
@@ -107,7 +107,7 @@
   (function() {
     'use strict';
 
-    const SHOPPE_URL = '{{shoppeUrl}}';
+    const AGORA_URL = '{{agoraUrl}}';
 
     function artifactIcon(name) {
       const ext = (name.split('.').pop() || '').toLowerCase();
@@ -134,7 +134,7 @@
       document.getElementById('check-btn').disabled = true;
 
       try {
-        const resp = await fetch(`${SHOPPE_URL}/membership/check`, {
+        const resp = await fetch(`${AGORA_URL}/membership/check`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ recoveryKey })
@@ -167,7 +167,7 @@
       container.innerHTML = '';
 
       if (subscriptions.length === 0) {
-        container.innerHTML = '<p style="color:#666;font-size:14px;">No subscription tiers found for this shoppe.</p>';
+        container.innerHTML = '<p style="color:#666;font-size:14px;">No subscription tiers found for this agora.</p>';
       } else {
         subscriptions.forEach(sub => renderCard(container, sub));
       }

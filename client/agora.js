@@ -1,6 +1,6 @@
 (function() {
 
-  window.plugins.shoppe = {
+  window.plugins.agora = {
     emit: function($item, item) {
       const div = $item[0];
       div.innerHTML = `
@@ -18,11 +18,11 @@
             .sw-step-body strong { color: #1d1d1f; }
             .sw-step-body code { background: #e8e8ed; border-radius: 4px; padding: 1px 5px; font-size: 12px; }
             .sw-tree { font-family: monospace; font-size: 12px; background: #1d1d1f; color: #a8f0a8; border-radius: 8px; padding: 14px 16px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; margin-top: 8px; }
-            .sw-shoppe { display: flex; align-items: center; justify-content: space-between; background: white; border: 1px solid #e5e5ea; border-radius: 10px; padding: 12px 16px; margin-bottom: 8px; }
-            .sw-shoppe-left { display: flex; flex-direction: column; gap: 2px; }
-            .sw-shoppe-name { font-weight: 600; font-size: 15px; }
-            .sw-shoppe-code { font-size: 18px; letter-spacing: 4px; }
-            .sw-shoppe-actions { display: flex; align-items: center; gap: 12px; }
+            .sw-agora { display: flex; align-items: center; justify-content: space-between; background: white; border: 1px solid #e5e5ea; border-radius: 10px; padding: 12px 16px; margin-bottom: 8px; }
+            .sw-agora-left { display: flex; flex-direction: column; gap: 2px; }
+            .sw-agora-name { font-weight: 600; font-size: 15px; }
+            .sw-agora-code { font-size: 18px; letter-spacing: 4px; }
+            .sw-agora-actions { display: flex; align-items: center; gap: 12px; }
             .sw-link { font-size: 13px; color: #0066cc; text-decoration: none; white-space: nowrap; }
             .sw-link:hover { text-decoration: underline; }
             .sw-btn-delete { background: none; border: none; color: #cc0000; font-size: 13px; cursor: pointer; padding: 0; white-space: nowrap; }
@@ -50,33 +50,39 @@
             .sw-progress-item { margin-top: 6px; font-size: 13px; font-style: italic; }
             .sw-remove { display: block; width: 100%; margin-top: 24px; padding: 8px; background: none; border: 1px solid #e5e5ea; border-radius: 8px; font-size: 12px; color: #aaa; cursor: pointer; text-align: center; }
             .sw-remove:hover { border-color: #cc0000; color: #cc0000; }
+            .sw-stripe-banner { display: none; margin-top: 16px; background: #fff8e1; border: 1px solid #f59e0b; border-radius: 10px; padding: 14px 16px; }
+            .sw-stripe-banner h4 { font-size: 14px; font-weight: 700; color: #92400e; margin-bottom: 6px; }
+            .sw-stripe-banner p { font-size: 13px; color: #78350f; margin-bottom: 10px; line-height: 1.5; }
+            .sw-stripe-banner.done { background: #d1fae5; border-color: #10b981; }
+            .sw-stripe-banner.done h4 { color: #065f46; }
+            .sw-stripe-banner.done p { color: #047857; }
           </style>
 
           <!-- Directory -->
           <div class="sw-section">
-            <h2>🛍️ Shoppe</h2>
-            <p style="font-size:14px;color:#555;margin:4px 0 16px">A multi-tenant digital goods marketplace. Browse the shoppes below, or open one of your own.</p>
-            <h3>Shoppes on this server</h3>
+            <h2>🛍️ Agora</h2>
+            <p style="font-size:14px;color:#555;margin:4px 0 16px">A multi-tenant digital goods marketplace. Browse the agoras below, or open one of your own.</p>
+            <h3>Agoras on this server</h3>
             <div id="sw-directory"><em class="sw-empty">Loading...</em></div>
           </div>
 
           <!-- How to join -->
           <div class="sw-section">
-            <h3>How to open a shoppe</h3>
+            <h3>How to open an agora</h3>
             <div class="sw-card">
               <div class="sw-step">
                 <div class="sw-step-num">1</div>
-                <div class="sw-step-body"><strong>Ask the wiki owner to register you.</strong> They'll download a <strong>starter bundle</strong> — a zip with your signing key, a template folder structure, and the <code>shoppe-sign.js</code> utility. Run <code>node shoppe-sign.js init</code> to store your key securely.</div>
+                <div class="sw-step-body"><strong>Ask the wiki owner to register you.</strong> They'll download a <strong>starter bundle</strong> — a zip with your signing key, a template folder structure, and the <code>agora-sign.js</code> utility. Run <code>node agora-sign.js init</code> to store your key securely.</div>
               </div>
               <div class="sw-step">
                 <div class="sw-step-num">2</div>
-                <div class="sw-step-body"><strong>Set up payouts</strong> by running <code>node shoppe-sign.js payouts</code>. This opens Stripe Connect onboarding so you can receive payments. Do this once before your first sale.</div>
+                <div class="sw-step-body"><strong>Set up payouts</strong> by running <code>node agora-sign.js payouts</code>. This opens Stripe Connect onboarding so you can receive payments. Do this once before your first sale.</div>
               </div>
               <div class="sw-step">
                 <div class="sw-step-num">3</div>
-                <div class="sw-step-body"><strong>Build your shoppe folder</strong> with this structure:
-                  <div class="sw-tree">my-shoppe.zip
-  manifest.json       ← { "uuid": "…", "emojicode": "…", "name": "My Shoppe" }
+                <div class="sw-step-body"><strong>Build your agora folder</strong> with this structure:
+                  <div class="sw-tree">my-agora.zip
+  manifest.json       ← { "uuid": "…", "emojicode": "…", "name": "My Agora" }
   books/
     My Novel/         ← subfolder per book
       my-novel.epub
@@ -128,15 +134,15 @@
               </div>
               <div class="sw-step">
                 <div class="sw-step-num">4</div>
-                <div class="sw-step-body"><strong>Run <code>node shoppe-sign.js</code></strong> from inside your shoppe folder. This signs your manifest and creates an <code>upload.zip</code> next to the folder.</div>
+                <div class="sw-step-body"><strong>Run <code>node agora-sign.js</code></strong> from inside your agora folder. This signs your manifest and creates an <code>upload.zip</code> next to the folder.</div>
               </div>
               <div class="sw-step">
                 <div class="sw-step-num">5</div>
-                <div class="sw-step-body"><strong>Drag <code>upload.zip</code> onto the upload zone below.</strong> Your goods will be registered and your shoppe will go live immediately.</div>
+                <div class="sw-step-body"><strong>Drag <code>upload.zip</code> onto the upload zone below.</strong> Your goods will be registered and your agora will go live immediately.</div>
               </div>
               <div class="sw-step">
                 <div class="sw-step-num">6</div>
-                <div class="sw-step-body"><strong>To update your shoppe</strong>, add content to your folder and run <code>node shoppe-sign.js</code> again — existing items are overwritten, new ones added.</div>
+                <div class="sw-step-body"><strong>To update your agora</strong>, add content to your folder and run <code>node agora-sign.js</code> again — existing items are overwritten, new ones added.</div>
               </div>
             </div>
           </div>
@@ -146,7 +152,7 @@
             <h3>Upload your archive</h3>
             <div class="sw-drop" id="sw-drop">
               <div style="font-size:40px">📦</div>
-              <p>Drag and drop your signed <code>upload.zip</code> here, or click to browse.<br>Run <code>node shoppe-sign.js</code> in your shoppe folder to create it.</p>
+              <p>Drag and drop your signed <code>upload.zip</code> here, or click to browse.<br>Run <code>node agora-sign.js</code> in your agora folder to create it.</p>
               <button class="sw-btn sw-btn-blue" id="sw-browse-btn">Choose Archive</button>
               <input type="file" id="sw-file-input" accept=".zip" style="display:none">
             </div>
@@ -162,9 +168,15 @@
             </div>
             <div id="sw-url-status" class="sw-status"></div>
 
-            <h3 style="margin-top:20px">Register a new shoppe (owner only)</h3>
+            <div class="sw-stripe-banner" id="sw-stripe-banner">
+              <h4 id="sw-stripe-banner-title">💳 Enable server payouts</h4>
+              <p id="sw-stripe-banner-desc">Complete Stripe onboarding so your server receives a 5% platform fee from all purchases across your tenants' agoras.</p>
+              <a id="sw-stripe-banner-btn" href="/plugin/agora/setup/stripe" target="_blank" class="sw-btn sw-btn-blue" style="text-decoration:none;display:inline-block;">Set up payouts →</a>
+            </div>
+
+            <h3 style="margin-top:20px">Register a new agora (owner only)</h3>
             <div class="sw-register">
-              <input type="text" id="sw-name-input" placeholder="Shoppe name (e.g. Zach's Art Store)">
+              <input type="text" id="sw-name-input" placeholder="Agora name (e.g. Zach's Art Store)">
               <button class="sw-btn sw-btn-green" id="sw-register-btn">Register</button>
             </div>
             <div id="sw-register-status" class="sw-status"></div>
@@ -209,21 +221,21 @@
   async function loadDirectory(container, isOwner = false) {
     const el = container.querySelector('#sw-directory');
     try {
-      const resp = await fetch(isOwner ? '/plugin/shoppe/tenants' : '/plugin/shoppe/directory');
+      const resp = await fetch(isOwner ? '/plugin/agora/tenants' : '/plugin/agora/directory');
       const result = await resp.json();
-      const shoppes = isOwner ? result.tenants : result.shoppes;
-      if (!result.success || !shoppes || shoppes.length === 0) {
-        el.innerHTML = '<em class="sw-empty">No shoppes yet — be the first!</em>';
+      const agoras = isOwner ? result.tenants : result.agoras;
+      if (!result.success || !agoras || agoras.length === 0) {
+        el.innerHTML = '<em class="sw-empty">No agoras yet — be the first!</em>';
         return;
       }
-      el.innerHTML = shoppes.map(s => `
-        <div class="sw-shoppe" id="sw-shoppe-${s.uuid}">
-          <div class="sw-shoppe-left">
-            <span class="sw-shoppe-name">${s.name}</span>
-            <span class="sw-shoppe-code">${s.emojicode}</span>
+      el.innerHTML = agoras.map(s => `
+        <div class="sw-agora" id="sw-agora-${s.uuid}">
+          <div class="sw-agora-left">
+            <span class="sw-agora-name">${s.name}</span>
+            <span class="sw-agora-code">${s.emojicode}</span>
           </div>
-          <div class="sw-shoppe-actions">
-            <a class="sw-link" href="${s.url}" target="_blank">Visit shoppe →</a>
+          <div class="sw-agora-actions">
+            <a class="sw-link" href="${s.url}" target="_blank">Visit agora →</a>
             ${isOwner ? `<button class="sw-btn-delete" data-uuid="${s.uuid}" data-name="${s.name}">Delete</button>` : ''}
           </div>
         </div>
@@ -231,7 +243,7 @@
 
       if (isOwner) {
         el.querySelectorAll('.sw-btn-delete').forEach(btn => {
-          btn.addEventListener('click', () => deleteShoppe(btn.dataset.uuid, btn.dataset.name, container));
+          btn.addEventListener('click', () => deleteAgora(btn.dataset.uuid, btn.dataset.name, container));
         });
       }
     } catch (err) {
@@ -243,13 +255,14 @@
 
   async function checkOwner(container) {
     try {
-      const resp = await fetch('/plugin/shoppe/config');
+      const resp = await fetch('/plugin/agora/config');
       if (resp.ok) {
         container.querySelector('#sw-owner-section').style.display = 'block';
         const result = await resp.json();
         if (result.sanoraUrl) {
           container.querySelector('#sw-url-input').value = result.sanoraUrl;
         }
+        updateStripeBanner(container, result);
         loadDirectory(container, true);
         return true;
       }
@@ -257,22 +270,50 @@
     return false;
   }
 
-  // ── Delete shoppe (owner) ────────────────────────────────────────────────────
+  function updateStripeBanner(container, result) {
+    const banner = container.querySelector('#sw-stripe-banner');
+    if (!banner) return;
+    if (!result.serverAddieReady) {
+      // Addie not reachable yet — don't show banner until URL is saved
+      banner.style.display = 'none';
+      return;
+    }
+    banner.style.display = 'block';
+    if (result.stripeOnboarded) {
+      banner.className = 'sw-stripe-banner done';
+      banner.querySelector('#sw-stripe-banner-title').textContent = '✅ Server payouts enabled';
+      banner.querySelector('#sw-stripe-banner-desc').textContent =
+        'Your server is connected to Stripe and will receive a 5% platform fee from all purchases.';
+      const btn = banner.querySelector('#sw-stripe-banner-btn');
+      btn.textContent = 'Update Stripe account';
+      btn.style.background = '#10b981';
+    } else {
+      banner.className = 'sw-stripe-banner';
+      banner.querySelector('#sw-stripe-banner-title').textContent = '💳 Enable server payouts';
+      banner.querySelector('#sw-stripe-banner-desc').textContent =
+        'Complete Stripe onboarding so your server receives a 5% platform fee from all purchases across your tenants\' agoras.';
+      const btn = banner.querySelector('#sw-stripe-banner-btn');
+      btn.textContent = 'Set up payouts →';
+      btn.style.background = '';
+    }
+  }
 
-  async function deleteShoppe(uuid, name, container) {
-    if (!confirm(`Delete "${name}"? This will remove the shoppe and all its products from Sanora.`)) return;
+  // ── Delete agora (owner) ────────────────────────────────────────────────────
 
-    const row = container.querySelector(`#sw-shoppe-${uuid}`);
+  async function deleteAgora(uuid, name, container) {
+    if (!confirm(`Delete "${name}"? This will remove the agora and all its products from Sanora.`)) return;
+
+    const row = container.querySelector(`#sw-agora-${uuid}`);
     if (row) row.style.opacity = '0.4';
 
     try {
-      const resp = await fetch(`/plugin/shoppe/${uuid}`, { method: 'DELETE' });
+      const resp = await fetch(`/plugin/agora/${uuid}`, { method: 'DELETE' });
       const result = await resp.json();
       if (!result.success) throw new Error(result.error || 'Delete failed');
       loadDirectory(container, true);
     } catch (err) {
       if (row) row.style.opacity = '1';
-      alert(`Could not delete shoppe: ${err.message}`);
+      alert(`Could not delete agora: ${err.message}`);
     }
   }
 
@@ -310,7 +351,7 @@
     });
 
     if (registerBtn) {
-      registerBtn.addEventListener('click', () => registerShoppe(container));
+      registerBtn.addEventListener('click', () => registerAgora(container));
     }
   }
 
@@ -325,7 +366,7 @@
     form.append('archive', file);
     let jobId;
     try {
-      const resp = await fetch('/plugin/shoppe/upload', { method: 'POST', body: form });
+      const resp = await fetch('/plugin/agora/upload', { method: 'POST', body: form });
       const result = await resp.json();
       if (!result.success || !result.jobId) throw new Error(result.error || 'Upload failed');
       jobId = result.jobId;
@@ -353,7 +394,7 @@
     const itemEl  = statusEl.querySelector('#sw-progress-item');
     const titleEl = statusEl.querySelector('#sw-progress-title');
 
-    const es = new EventSource(`/plugin/shoppe/upload/progress/${jobId}`);
+    const es = new EventSource(`/plugin/agora/upload/progress/${jobId}`);
 
     es.addEventListener('start', e => {
       const { total, name } = JSON.parse(e.data);
@@ -388,7 +429,7 @@
         : '';
       showStatus(container, '#sw-upload-status',
         `✅ <strong>${result.tenant.name}</strong> ${result.tenant.emojicode} updated — ${counts}${warnings}<br>
-         <a href="/plugin/shoppe/${result.tenant.uuid}" target="_blank" class="sw-link" style="display:inline-block;margin-top:8px;">View your shoppe →</a>`,
+         <a href="/plugin/agora/${result.tenant.uuid}" target="_blank" class="sw-link" style="display:inline-block;margin-top:8px;">View your agora →</a>`,
         'success');
       loadDirectory(container);
     });
@@ -412,7 +453,7 @@
     urlBtn.disabled = true;
     urlBtn.textContent = 'Saving…';
     try {
-      const resp = await fetch('/plugin/shoppe/config', {
+      const resp = await fetch('/plugin/agora/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sanoraUrl: url })
@@ -420,6 +461,7 @@
       const result = await resp.json();
       if (!result.success) throw new Error(result.error || 'Save failed');
       showStatus(container, '#sw-url-status', `✅ Connected to <strong>${url}</strong>`, 'success');
+      updateStripeBanner(container, result);
     } catch (err) {
       showStatus(container, '#sw-url-status', `❌ ${err.message}`, 'error');
     } finally {
@@ -430,16 +472,16 @@
 
   // ── Register (owner) ────────────────────────────────────────────────────────
 
-  async function registerShoppe(container) {
+  async function registerAgora(container) {
     const nameInput   = container.querySelector('#sw-name-input');
     const registerBtn = container.querySelector('#sw-register-btn');
     const name = nameInput.value.trim();
-    if (!name) { showStatus(container, '#sw-register-status', 'Enter a shoppe name first', 'error'); return; }
+    if (!name) { showStatus(container, '#sw-register-status', 'Enter an agora name first', 'error'); return; }
 
     registerBtn.disabled = true;
     registerBtn.textContent = 'Registering…';
     try {
-      const resp = await fetch('/plugin/shoppe/register', {
+      const resp = await fetch('/plugin/agora/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name })
@@ -448,13 +490,13 @@
       if (!result.success) throw new Error(result.error || 'Registration failed');
 
       nameInput.value = '';
-      const bundleUrl = result.bundleToken ? `/plugin/shoppe/bundle/${result.bundleToken}` : null;
+      const bundleUrl = result.bundleToken ? `/plugin/agora/bundle/${result.bundleToken}` : null;
       showStatus(container, '#sw-register-status',
         `✅ <strong>${result.tenant.name}</strong> registered!<br>
          Emojicode: <strong>${result.tenant.emojicode}</strong><br><br>
          ${bundleUrl
            ? `<a href="${bundleUrl}" class="sw-btn sw-btn-green" style="display:inline-block;text-decoration:none;margin-bottom:8px;">⬇️ Download Starter Bundle</a><br>
-              <span style="font-size:12px;color:#555;">Hand this zip to the shoppe owner. The download link expires in 15 minutes and works only once.</span>`
+              <span style="font-size:12px;color:#555;">Hand this zip to the agora owner. The download link expires in 15 minutes and works only once.</span>`
            : `UUID: <code>${result.tenant.uuid}</code>`}`,
         'success');
       loadDirectory(container);

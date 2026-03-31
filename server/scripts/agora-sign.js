@@ -2,17 +2,17 @@
 'use strict';
 
 /**
- * shoppe-sign.js — Shoppe archive signing utility
+ * agora-sign.js — Agora archive signing utility
  *
  * Commands:
- *   node shoppe-sign.js init            First run: moves shoppe-key.json to ~/.shoppe/keys/
+ *   node agora-sign.js init            First run: moves agora-key.json to ~/.agora/keys/
  *                                       and removes it from this directory.
  *
- *   node shoppe-sign.js                 Signs manifest.json and creates a ready-to-upload zip.
+ *   node agora-sign.js                 Signs manifest.json and creates a ready-to-upload zip.
  *
- *   node shoppe-sign.js orders          Generates a signed orders URL (opens in browser).
+ *   node agora-sign.js orders          Generates a signed orders URL (opens in browser).
  *
- *   node shoppe-sign.js payouts         Opens Stripe Connect Express onboarding.
+ *   node agora-sign.js payouts         Opens Stripe Connect Express onboarding.
  *
  * Requires Node.js 16+ and sessionless-node (run `npm install` once).
  */
@@ -24,10 +24,10 @@ const { execSync } = require('child_process');
 
 // ── Paths ────────────────────────────────────────────────────────────────────
 
-const SHOPPE_DIR = __dirname;
-const KEYS_DIR   = path.join(os.homedir(), '.shoppe', 'keys');
-const MANIFEST   = path.join(SHOPPE_DIR, 'manifest.json');
-const LOCAL_KEY  = path.join(SHOPPE_DIR, 'shoppe-key.json');
+const AGORA_DIR = __dirname;
+const KEYS_DIR   = path.join(os.homedir(), '.agora', 'keys');
+const MANIFEST   = path.join(AGORA_DIR, 'manifest.json');
+const LOCAL_KEY  = path.join(AGORA_DIR, 'agora-key.json');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -37,7 +37,7 @@ function ensureDir(dir) {
 
 function readManifest() {
   if (!fs.existsSync(MANIFEST)) {
-    console.error('❌  manifest.json not found in:', SHOPPE_DIR);
+    console.error('❌  manifest.json not found in:', AGORA_DIR);
     process.exit(1);
   }
   try {
@@ -56,7 +56,7 @@ function loadStoredKey(uuid) {
   const kp = keyFilePath(uuid);
   if (!fs.existsSync(kp)) {
     console.error('❌  No signing key found at:', kp);
-    console.error('   If this is a new shoppe run:  node shoppe-sign.js init');
+    console.error('   If this is a new agora run:  node agora-sign.js init');
     process.exit(1);
   }
   try {
@@ -80,9 +80,9 @@ function init() {
     if (fs.existsSync(kp)) {
       console.log('✅  Already initialized. Your key is at:');
       console.log('   ', kp);
-      console.log('\nWhenever you want to upload, run:  node shoppe-sign.js');
+      console.log('\nWhenever you want to upload, run:  node agora-sign.js');
     } else {
-      console.error('❌  shoppe-key.json not found and no stored key exists.');
+      console.error('❌  agora-key.json not found and no stored key exists.');
       console.error('   Download a fresh starter bundle from your wiki.');
     }
     return;
@@ -92,12 +92,12 @@ function init() {
   try {
     keyData = JSON.parse(fs.readFileSync(LOCAL_KEY, 'utf8'));
   } catch (err) {
-    console.error('❌  shoppe-key.json is not valid JSON:', err.message);
+    console.error('❌  agora-key.json is not valid JSON:', err.message);
     process.exit(1);
   }
 
   if (!keyData.privateKey || !keyData.pubKey) {
-    console.error('❌  shoppe-key.json is missing privateKey or pubKey fields.');
+    console.error('❌  agora-key.json is missing privateKey or pubKey fields.');
     process.exit(1);
   }
 
@@ -110,10 +110,10 @@ function init() {
 
   console.log('✅  Key stored at:');
   console.log('   ', kp);
-  console.log('   shoppe-key.json has been removed from this folder.\n');
+  console.log('   agora-key.json has been removed from this folder.\n');
   console.log('Next steps:');
   console.log('  npm install           (one-time, installs sessionless-node)');
-  console.log('  node shoppe-sign.js   (sign and zip whenever you want to upload)');
+  console.log('  node agora-sign.js   (sign and zip whenever you want to upload)');
 }
 
 // ── sign — sign manifest and create upload zip ───────────────────────────────
@@ -137,8 +137,8 @@ async function sign() {
   }
 
   if (fs.existsSync(LOCAL_KEY)) {
-    console.error('⚠️   shoppe-key.json is still in this folder.');
-    console.error('   Run  node shoppe-sign.js init  to store it securely first.');
+    console.error('⚠️   agora-key.json is still in this folder.');
+    console.error('   Run  node agora-sign.js init  to store it securely first.');
     process.exit(1);
   }
 
@@ -164,9 +164,9 @@ async function sign() {
 // ── zip ──────────────────────────────────────────────────────────────────────
 
 function createZip() {
-  // Place the zip *next to* the shoppe folder so it can't include itself
-  const folderName = path.basename(SHOPPE_DIR);
-  const parentDir  = path.dirname(SHOPPE_DIR);
+  // Place the zip *next to* the agora folder so it can't include itself
+  const folderName = path.basename(AGORA_DIR);
+  const parentDir  = path.dirname(AGORA_DIR);
   const outputZip  = path.join(parentDir, `${folderName}-upload.zip`);
 
   if (fs.existsSync(outputZip)) {
@@ -176,28 +176,28 @@ function createZip() {
   console.log('\n📦  Creating upload archive...');
   try {
     if (process.platform === 'win32') {
-      // Collect items to include (exclude shoppe-key.json if somehow still present)
-      const items = fs.readdirSync(SHOPPE_DIR)
-        .filter(f => f !== 'shoppe-key.json')
-        .map(f => `"${path.join(SHOPPE_DIR, f).replace(/"/g, '`"')}"`)
+      // Collect items to include (exclude agora-key.json if somehow still present)
+      const items = fs.readdirSync(AGORA_DIR)
+        .filter(f => f !== 'agora-key.json')
+        .map(f => `"${path.join(AGORA_DIR, f).replace(/"/g, '`"')}"`)
         .join(',');
       const psCmd = `Compress-Archive -Path @(${items}) -DestinationPath "${outputZip.replace(/\\/g, '\\\\')}" -Force`;
       execSync(`powershell -NoProfile -Command "${psCmd}"`, { stdio: 'pipe' });
     } else {
       execSync(
-        `zip -r "${outputZip}" . -x "*/shoppe-key.json" -x "*.mp4" -x "*.mov" -x "*.mkv" -x "*.webm" -x "*.avi"`,
-        { cwd: SHOPPE_DIR, stdio: 'pipe' }
+        `zip -r "${outputZip}" . -x "*/agora-key.json" -x "*.mp4" -x "*.mov" -x "*.mkv" -x "*.webm" -x "*.avi"`,
+        { cwd: AGORA_DIR, stdio: 'pipe' }
       );
     }
     console.log(`✅  Created: ${path.basename(outputZip)}`);
     console.log(`   Location: ${outputZip}`);
-    console.log('\n   Drag that file onto your wiki\'s shoppe plugin to upload.');
+    console.log('\n   Drag that file onto your wiki\'s agora plugin to upload.');
   } catch (err) {
     console.log('⚠️   Could not auto-create zip:', err.message);
-    console.log('\nZip this folder manually (excluding shoppe-key.json):');
+    console.log('\nZip this folder manually (excluding agora-key.json):');
     if (process.platform !== 'win32') {
       console.log(`  cd "${parentDir}"`);
-      console.log(`  zip -r "${path.basename(outputZip)}" "${folderName}" -x "*/shoppe-key.json"`);
+      console.log(`  zip -r "${path.basename(outputZip)}" "${folderName}" -x "*/agora-key.json"`);
     } else {
       console.log('  Right-click the folder in File Explorer → Send to → Compressed folder');
     }
@@ -224,8 +224,8 @@ async function orders() {
   }
 
   if (fs.existsSync(LOCAL_KEY)) {
-    console.error('⚠️   shoppe-key.json is still in this folder.');
-    console.error('   Run  node shoppe-sign.js init  first.');
+    console.error('⚠️   agora-key.json is still in this folder.');
+    console.error('   Run  node agora-sign.js init  first.');
     process.exit(1);
   }
 
@@ -245,7 +245,7 @@ async function orders() {
       ? manifest.wikiUrl.replace(/\/orders.*$/, '') // strip any existing /orders path
       : null;
 
-  const ordersPath = `/plugin/shoppe/${manifest.uuid}/orders?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`;
+  const ordersPath = `/plugin/agora/${manifest.uuid}/orders?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`;
   const fullUrl    = baseUrl ? `${baseUrl}/orders?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}` : null;
 
   console.log('\n🔑  Signed orders URL (valid for 5 minutes):\n');
@@ -256,7 +256,7 @@ async function orders() {
     console.log('\n   Prepend your wiki URL, e.g.:');
     console.log('   https://mywiki.com' + ordersPath);
     console.log('\n   Or pass your wiki URL as an argument next time:');
-    console.log('   node shoppe-sign.js orders https://mywiki.com');
+    console.log('   node agora-sign.js orders https://mywiki.com');
   }
 
   // Try to open in the default browser
@@ -273,7 +273,7 @@ async function orders() {
   console.log('');
 }
 
-// ── upload — generate a signed shoppe URL for video uploading ────────────────
+// ── upload — generate a signed agora URL for video uploading ────────────────
 
 async function upload() {
   let sessionless;
@@ -293,8 +293,8 @@ async function upload() {
   }
 
   if (fs.existsSync(LOCAL_KEY)) {
-    console.error('⚠️   shoppe-key.json is still in this folder.');
-    console.error('   Run  node shoppe-sign.js init  first.');
+    console.error('⚠️   agora-key.json is still in this folder.');
+    console.error('   Run  node agora-sign.js init  first.');
     process.exit(1);
   }
 
@@ -313,18 +313,18 @@ async function upload() {
       ? manifest.wikiUrl.replace(/\/plugin.*$/, '')
       : null;
 
-  const shoppePath = `/plugin/shoppe/${manifest.uuid}?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`;
-  const fullUrl    = baseUrl ? `${baseUrl}${shoppePath}` : null;
+  const agoraPath =`/plugin/agora/${manifest.uuid}?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`;
+  const fullUrl    = baseUrl ? `${baseUrl}${agoraPath}` : null;
 
-  console.log('\n🎬  Signed shoppe URL for video uploading (valid for 24 hours):\n');
+  console.log('\n🎬  Signed agora URL for video uploading (valid for 24 hours):\n');
   if (fullUrl) {
     console.log('   ' + fullUrl);
   } else {
-    console.log('   Path: ' + shoppePath);
+    console.log('   Path: ' + agoraPath);
     console.log('\n   Prepend your wiki URL, e.g.:');
-    console.log('   https://mywiki.com' + shoppePath);
+    console.log('   https://mywiki.com' + agoraPath);
     console.log('\n   Or pass your wiki URL as an argument:');
-    console.log('   node shoppe-sign.js upload https://mywiki.com');
+    console.log('   node agora-sign.js upload https://mywiki.com');
   }
 
   if (fullUrl) {
@@ -358,8 +358,8 @@ async function payouts() {
   }
 
   if (fs.existsSync(LOCAL_KEY)) {
-    console.error('⚠️   shoppe-key.json is still in this folder.');
-    console.error('   Run  node shoppe-sign.js init  first.');
+    console.error('⚠️   agora-key.json is still in this folder.');
+    console.error('   Run  node agora-sign.js init  first.');
     process.exit(1);
   }
 
@@ -379,7 +379,7 @@ async function payouts() {
       ? manifest.wikiUrl.replace(/\/payouts.*$/, '') // strip any existing /payouts path
       : null;
 
-  const payoutsPath = `/plugin/shoppe/${manifest.uuid}/payouts?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`;
+  const payoutsPath = `/plugin/agora/${manifest.uuid}/payouts?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`;
   const fullUrl     = baseUrl ? `${baseUrl}/payouts?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}` : null;
 
   console.log('\n💳  Stripe Connect onboarding URL (valid for 5 minutes):\n');
@@ -390,7 +390,7 @@ async function payouts() {
     console.log('\n   Prepend your wiki URL, e.g.:');
     console.log('   https://mywiki.com' + payoutsPath);
     console.log('\n   Or pass your wiki URL as an argument next time:');
-    console.log('   node shoppe-sign.js payouts https://mywiki.com');
+    console.log('   node agora-sign.js payouts https://mywiki.com');
   }
 
   // Try to open in the default browser
@@ -434,6 +434,6 @@ if (command === 'init') {
   });
 } else {
   console.error(`Unknown command: ${command}`);
-  console.error('Usage:  node shoppe-sign.js [init | orders [wiki-url] | payouts [wiki-url]]');
+  console.error('Usage:  node agora-sign.js [init | orders [wiki-url] | payouts [wiki-url]]');
   process.exit(1);
 }
