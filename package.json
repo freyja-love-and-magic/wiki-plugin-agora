@@ -1,6 +1,6 @@
 {
   "name": "wiki-plugin-agora",
-  "version": "0.0.49",
+  "version": "0.0.3",
   "description": "Multi-tenant digital goods agora for federated wiki, powered by Sanora",
   "keywords": [
     "wiki",

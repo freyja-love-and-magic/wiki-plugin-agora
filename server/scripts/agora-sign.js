@@ -237,16 +237,25 @@ async function orders() {
   sessionless.getKeys = () => ({ pubKey: keyData.pubKey, privateKey: keyData.privateKey });
   const signature = await sessionless.sign(message);
 
-  // Determine base URL: manifest.wikiUrl, CLI argument, or just show the path
+  // Determine base URL: CLI argument > manifest.wikiUrl > nothing
   const wikiUrlArg = process.argv[3];
   const baseUrl    = wikiUrlArg
     ? wikiUrlArg.replace(/\/+$/, '')
     : manifest.wikiUrl
-      ? manifest.wikiUrl.replace(/\/orders.*$/, '') // strip any existing /orders path
+      ? manifest.wikiUrl.replace(/\/plugin\/agora.*$/, '')
       : null;
 
+  // Persist wikiUrl to manifest on first use so future runs don't need the arg
+  if (wikiUrlArg && !manifest.wikiUrl) {
+    try {
+      manifest.wikiUrl = wikiUrlArg.replace(/\/+$/, '');
+      fs.writeFileSync(MANIFEST, JSON.stringify(manifest, null, 2));
+      console.log(`   Saved wiki URL to manifest.json for future use.`);
+    } catch (_) { /* non-fatal */ }
+  }
+
   const ordersPath = `/plugin/agora/${manifest.uuid}/orders?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`;
-  const fullUrl    = baseUrl ? `${baseUrl}/orders?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}` : null;
+  const fullUrl    = baseUrl ? `${baseUrl}${ordersPath}` : null;
 
   console.log('\n🔑  Signed orders URL (valid for 5 minutes):\n');
   if (fullUrl) {
@@ -371,16 +380,23 @@ async function payouts() {
   sessionless.getKeys = () => ({ pubKey: keyData.pubKey, privateKey: keyData.privateKey });
   const signature = await sessionless.sign(message);
 
-  // Determine base URL: manifest.wikiUrl, CLI argument, or just show the path
   const wikiUrlArg = process.argv[3];
   const baseUrl    = wikiUrlArg
     ? wikiUrlArg.replace(/\/+$/, '')
     : manifest.wikiUrl
-      ? manifest.wikiUrl.replace(/\/payouts.*$/, '') // strip any existing /payouts path
+      ? manifest.wikiUrl.replace(/\/plugin\/agora.*$/, '')
       : null;
 
+  if (wikiUrlArg && !manifest.wikiUrl) {
+    try {
+      manifest.wikiUrl = wikiUrlArg.replace(/\/+$/, '');
+      fs.writeFileSync(MANIFEST, JSON.stringify(manifest, null, 2));
+      console.log(`   Saved wiki URL to manifest.json for future use.`);
+    } catch (_) { /* non-fatal */ }
+  }
+
   const payoutsPath = `/plugin/agora/${manifest.uuid}/payouts?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`;
-  const fullUrl     = baseUrl ? `${baseUrl}/payouts?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}` : null;
+  const fullUrl     = baseUrl ? `${baseUrl}${payoutsPath}` : null;
 
   console.log('\n💳  Stripe Connect onboarding URL (valid for 5 minutes):\n');
   if (fullUrl) {

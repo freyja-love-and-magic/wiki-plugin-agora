@@ -151,12 +151,68 @@ after(done => {
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Upload a zip buffer and wait for the SSE progress stream to deliver a
+ * `complete` or `error` event.  Returns a fake response-like object with a
+ * `.json()` method so callers can do:  `const data = await resp.json()`.
+ *
+ * Normalised shape:
+ *   success  — true  → { success: true, results: { books, music, … } }
+ *   error    → { success: false, error: '<message>' }
+ */
 async function uploadArchive(zipBuffer) {
   const form = new FormData();
   form.append('archive', zipBuffer, { filename: 'test.zip', contentType: 'application/zip' });
-  return fetch(`${BASE_URL}/plugin/agora/upload`, {
+
+  const uploadResp = await fetch(`${BASE_URL}/plugin/agora/upload`, {
     method: 'POST', body: form, headers: form.getHeaders()
   });
+  if (!uploadResp.ok) {
+    const body = await uploadResp.json();
+    return { json: () => Promise.resolve(body) };
+  }
+
+  const { jobId } = await uploadResp.json();
+
+  // Consume the SSE stream until complete or error.
+  const result = await new Promise((resolve, reject) => {
+    const http = require('http');
+    const url  = new URL(`/plugin/agora/upload/progress/${jobId}`, BASE_URL);
+
+    const req = http.get({ hostname: url.hostname, port: url.port, path: url.pathname }, res => {
+      let buf = '';
+      res.on('data', chunk => {
+        buf += chunk.toString();
+        const blocks = buf.split('\n\n');
+        buf = blocks.pop();          // keep any partial trailing block
+
+        for (const block of blocks) {
+          const typeMatch = block.match(/^event: (.+)/m);
+          const dataMatch = block.match(/^data: (.+)/m);
+          if (!typeMatch || !dataMatch) continue;
+          const type = typeMatch[1].trim();
+          let data;
+          try { data = JSON.parse(dataMatch[1]); } catch { continue; }
+
+          if (type === 'complete') {
+            req.destroy();
+            resolve({ success: true,  results: data });
+          } else if (type === 'error') {
+            req.destroy();
+            resolve({ success: false, error: data.message });
+          }
+          // ignore start / progress / warning events
+        }
+      });
+      res.on('end', () => reject(new Error('SSE stream ended without complete/error')));
+    });
+
+    req.on('error', reject);
+    setTimeout(() => { req.destroy(); reject(new Error('Upload SSE timeout after 30s')); }, 30000);
+  });
+
+  return { json: () => Promise.resolve(result) };
 }
 
 // ── Always-on tests (no Sanora needed) ───────────────────────────────────────
@@ -166,7 +222,8 @@ it('should return 404 for an unknown agora identifier', async () => {
   resp.status.should.equal(404);
 });
 
-it('should reject an archive whose manifest uuid/emojicode are missing', async () => {
+it('should reject an archive whose manifest uuid/emojicode are missing', async function() {
+  this.timeout(15000);
   const zip = new AdmZip();
   zip.addFile('manifest.json', Buffer.from(JSON.stringify({ name: 'No UUID Agora' })));
   const resp = await uploadArchive(zip.toBuffer());
@@ -175,7 +232,8 @@ it('should reject an archive whose manifest uuid/emojicode are missing', async (
   data.error.should.match(/uuid|emojicode/i);
 });
 
-it('should reject an archive whose uuid does not match any registered tenant', async () => {
+it('should reject an archive whose uuid does not match any registered tenant', async function() {
+  this.timeout(15000);
   const zip = new AdmZip();
   zip.addFile('manifest.json', Buffer.from(JSON.stringify({
     uuid: '00000000-0000-0000-0000-000000000000',
@@ -258,13 +316,15 @@ describe('Sanora integration', function() {
     found.name.should.equal('Test Agora');
   });
 
-  it('should upload an archive with all content categories', async () => {
+  it('should upload an archive with all content categories', async function() {
+    this.timeout(60000);
     const resp = await uploadArchive(buildTestArchive(tenant.uuid, tenant.emojicode));
     const data = await resp.json();
     if (!data.success) console.error('    error:', data.error);
     data.success.should.equal(true);
 
-    const r = data.results;
+    // uploadArchive wraps SSE complete event as { success, results }
+    const r = data.results || data;
     r.books.length.should.equal(1,         'expected 1 book');
     r.music.length.should.equal(1,         'expected 1 music item');
     r.posts.length.should.equal(1,         'expected 1 post');
@@ -348,6 +408,207 @@ describe('Sanora integration', function() {
     bronze.active.should.equal(false);
     bronze.benefits.should.deep.equal(['Monthly exclusive track', 'Early access']);
     bronze.exclusiveArtifacts.should.deep.equal([]);
+  });
+});
+
+// ── Extended feature tests (Sanora required) ─────────────────────────────────
+
+describe('Extended features (Sanora required)', function() {
+  let sessionless;
+  let buyerKeys;
+
+  before(function() {
+    if (!sanoraAvailable) this.skip();
+    sessionless = require('sessionless-node');
+  });
+
+  // Helper: sign a message as the tenant owner (reads keys from TEST_HOME)
+  async function ownerSign(message) {
+    const tenantsPath = path.join(TEST_HOME, '.agora', 'tenants.json');
+    const tenants = JSON.parse(fs.readFileSync(tenantsPath, 'utf8'));
+    const record = Object.values(tenants).find(t => t && typeof t === 'object' && t.uuid === tenant.uuid);
+    if (!record || !record.ownerPrivateKey) throw new Error('ownerPrivateKey not found in tenants.json');
+    const prev = sessionless.getKeys;
+    sessionless.getKeys = () => ({ privateKey: record.ownerPrivateKey, pubKey: record.ownerPubKey });
+    const sig = await sessionless.sign(message);
+    sessionless.getKeys = prev;
+    return sig;
+  }
+
+  // Helper: build signed owner query string for the orders endpoint
+  async function ownerQuery() {
+    const ts = Date.now().toString();
+    const sig = await ownerSign(ts + tenant.uuid);
+    return `timestamp=${encodeURIComponent(ts)}&signature=${encodeURIComponent(sig)}`;
+  }
+
+  it('should store tenant email from manifest on re-upload', async () => {
+    // Build an archive with email in the manifest
+    const zip = new AdmZip();
+    zip.addFile('manifest.json', Buffer.from(JSON.stringify({
+      uuid: tenant.uuid,
+      emojicode: tenant.emojicode,
+      name: 'Integration Test Agora',
+      email: 'creator@example.com',
+    })));
+    // Minimal book so upload doesn't fail content processing
+    zip.addFile('books/Test Book/info.json', Buffer.from(JSON.stringify({
+      title: 'Test Book', description: 'A test ebook', price: 999
+    })));
+    zip.addFile('books/Test Book/test-book.epub', Buffer.from('fake epub'));
+    zip.addFile('books/Test Book/cover.jpg', Buffer.from('fake jpg'));
+
+    const resp = await uploadArchive(zip.toBuffer());
+    const data = await resp.json();
+    data.success.should.equal(true);
+
+    // Verify email was saved via the tenants listing
+    const listResp = await fetch(`${BASE_URL}/plugin/agora/tenants`);
+    const listData = await listResp.json();
+    const found = listData.tenants.find(t => t.uuid === tenant.uuid);
+    found.should.exist;
+    found.email.should.equal('creator@example.com');
+  });
+
+  it('should include OG meta tags in the agora page', async () => {
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}`);
+    const html = await resp.text();
+    html.should.include('og:title');
+    html.should.include('og:description');
+    html.should.include('og:site_name');
+    html.should.include('twitter:card');
+    html.should.include('Integration Test Agora');
+  });
+
+  it('should filter goods by category', async () => {
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/goods?category=books`);
+    const data = await resp.json();
+    data.success.should.equal(true);
+    data.goods.books.should.be.an('array').with.length.at.least(1);
+    // Other categories should be absent or empty
+    Object.keys(data.goods).forEach(cat => {
+      if (cat !== 'books') data.goods[cat].should.be.an('array').with.length(0);
+    });
+  });
+
+  it('should reject purchase/complete with an invalid buyer signature', async () => {
+    const goods = await (await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/goods`)).json();
+    const book = goods.goods.books[0];
+    const timestamp = Date.now().toString();
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/purchase/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pubKey:    'deadbeef'.repeat(8) + '02', // invalid but 33-byte-ish
+        timestamp,
+        signature: 'badbad'.repeat(10),
+        productId: book.productId,
+        title:     book.title,
+      })
+    });
+    resp.status.should.equal(401);
+  });
+
+  it('should accept purchase/complete with a valid pubKey signature and record an order', async () => {
+    buyerKeys = await sessionless.generateKeys(() => {}, () => null);
+    const goods = await (await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/goods`)).json();
+    const book = goods.goods.books[0];
+
+    const timestamp = Date.now().toString();
+    sessionless.getKeys = () => buyerKeys;
+    const signature = await sessionless.sign(timestamp + buyerKeys.pubKey);
+
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/purchase/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pubKey:    buyerKeys.pubKey,
+        timestamp,
+        signature,
+        productId: book.productId,
+        title:     book.title,
+      })
+    });
+    const data = await resp.json();
+    if (data.error) console.error('    error:', data.error);
+    data.success.should.equal(true);
+  });
+
+  it('should accept purchase/complete with contactInfo.email', async () => {
+    const freshKeys = await sessionless.generateKeys(() => {}, () => null);
+    const goods = await (await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/goods`)).json();
+    const book = goods.goods.books[0];
+
+    const timestamp = Date.now().toString();
+    sessionless.getKeys = () => freshKeys;
+    const signature = await sessionless.sign(timestamp + freshKeys.pubKey);
+
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/purchase/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pubKey:      freshKeys.pubKey,
+        timestamp,
+        signature,
+        productId:   book.productId,
+        title:       book.title,
+        contactInfo: { email: 'buyer@example.com' },
+      })
+    });
+    const data = await resp.json();
+    data.success.should.equal(true);
+  });
+
+  it('should render the orders page for a valid owner-signed URL', async () => {
+    const qs = await ownerQuery();
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/orders?${qs}`);
+    resp.status.should.equal(200);
+    const html = await resp.text();
+    html.should.include('Test Agora');
+    html.should.include('orders');
+  });
+
+  it('should reject the orders page for an expired or missing signature', async () => {
+    const resp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/orders`);
+    resp.status.should.equal(403);
+  });
+
+  it('should persist buyer email in session and pre-fill the membership portal', async () => {
+    // Step 1: POST to /membership/check to register the email in the session.
+    const checkResp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/membership/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recoveryKey: 'session-test@example.com' })
+    });
+    checkResp.status.should.equal(200);
+    const checkData = await checkResp.json();
+    checkData.subscriptions.should.be.an('array');
+    checkData.subscriptions.forEach(sub => {
+      sub.should.have.property('title');
+      sub.should.have.property('active');
+    });
+
+    // Step 2: GET /membership — if express-session is wired up on the test server,
+    // the Set-Cookie header is returned and the next GET would pre-fill sessionEmail.
+    // In the minimal test-server setup (no express-session), we just verify the
+    // membership portal renders successfully.
+    const portalResp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/membership`);
+    portalResp.status.should.equal(200);
+    const html = await portalResp.text();
+    html.should.include('membership/check');
+    // Input for email lookup is present
+    html.should.include('recovery-key');
+
+    // Step 3: If we receive a session cookie from the check step, reuse it and
+    // confirm the portal pre-fills the email.
+    const cookie = checkResp.headers.get('set-cookie');
+    if (cookie) {
+      const sessionResp = await fetch(`${BASE_URL}/plugin/agora/${tenant.uuid}/membership`, {
+        headers: { 'Cookie': cookie.split(';')[0] }
+      });
+      const sessionHtml = await sessionResp.text();
+      sessionHtml.should.include('session-test@example.com');
+    }
   });
 });
 

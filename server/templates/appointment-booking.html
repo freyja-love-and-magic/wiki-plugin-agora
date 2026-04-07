@@ -125,18 +125,10 @@
       <div id="slot-grid" class="slot-grid"></div>
     </div>
 
-    <!-- Contact info + recovery key form -->
+    <!-- Contact info form -->
     <div id="booking-form" class="booking-form">
       <div id="selected-slot-display" class="selected-slot-display"></div>
 
-      <div class="recovery-note">
-        🔑 Choose a recovery key — a word or phrase only you know. You'll use it to look up your booking confirmation later.
-      </div>
-
-      <div class="field-group">
-        <label>Recovery Key *</label>
-        <input type="text" id="recovery-key" placeholder="e.g. sunflower-2026" autocomplete="off">
-      </div>
       <div class="field-group">
         <label>Your Name *</label>
         <input type="text" id="contact-name" placeholder="Full name">
@@ -173,7 +165,7 @@
       <div id="confirmation-slot" class="slot-confirmed"></div>
       <p>{{title}}</p>
       <p style="margin-top:16px;">A confirmation has been sent to the service provider.</p>
-      <p style="margin-top:8px; font-size:13px; color:#666;">Keep your recovery key safe — you can use it to look up this booking.</p>
+      <p style="margin-top:8px; font-size:13px; color:#666;">A confirmation has been sent to your email.</p>
       <button class="btn-outline" style="margin-top:24px; max-width:200px;" onclick="window.location.href='{{agoraUrl}}'">← Back to Agora</button>
     </div>
 
@@ -328,16 +320,17 @@
   // ── Proceed to payment ────────────────────────────────────────────────────
 
   window.proceedToPay = async function() {
-    const recoveryKey  = document.getElementById('recovery-key').value.trim();
     const name         = document.getElementById('contact-name').value.trim();
     const email        = document.getElementById('contact-email').value.trim();
     const errorEl      = document.getElementById('form-error');
 
-    if (!recoveryKey) { showFormError('Recovery key is required.'); return; }
     if (!name)        { showFormError('Name is required.'); return; }
     if (!email)       { showFormError('Email is required.'); return; }
     if (!selectedSlot){ showFormError('Please select a time slot.'); return; }
     errorEl.style.display = 'none';
+
+    // Use email as the internal recoveryKey — no separate key needed for appointments
+    const recoveryKey = email;
 
     document.getElementById('proceed-to-pay').disabled = true;
 
@@ -358,11 +351,7 @@
 
       if (data.free) {
         // Free booking — skip Stripe and record directly
-        const contactInfo = {
-          name:  document.getElementById('contact-name').value.trim(),
-          email: document.getElementById('contact-email').value.trim(),
-          phone: document.getElementById('contact-phone').value.trim()
-        };
+        const contactInfo = { name, email, phone: document.getElementById('contact-phone').value.trim() };
         await fetch(`${AGORA_URL}/purchase/complete`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -419,10 +408,11 @@
       }
 
       // Payment succeeded — record booking server-side (contact info never goes direct to Sanora)
-      const recoveryKey  = document.getElementById('recovery-key').value.trim();
+      const email        = document.getElementById('contact-email').value.trim();
+      const recoveryKey  = email;
       const contactInfo  = {
         name:  document.getElementById('contact-name').value.trim(),
-        email: document.getElementById('contact-email').value.trim(),
+        email,
         phone: document.getElementById('contact-phone').value.trim()
       };
       const paymentIntentId = window.clientSecret ? window.clientSecret.split('_secret_')[0] : undefined;

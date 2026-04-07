@@ -150,28 +150,36 @@
     </div>
   </div>
 
-  <!-- ── Legacy recovery key path ─────────────────────────────────────────── -->
   <div id="forms-section">
-    <div style="max-width: 1200px; margin: 0 auto;">
+    <div style="max-width: 520px; margin: 0 auto;">
       <h2>Complete Your Purchase</h2>
-      <div id="forms-grid">
-        <div>
-          <h3 style="margin-bottom: 20px; color: #a855f7;">Recovery Information</h3>
-          <div id="address-form"></div>
-        </div>
-        <div id="payment-section">
-          <h3>Payment Details</h3>
-          <form id="payment-form">
-            <div class="amount-display">
-              <div class="label">Total</div>
-              <div class="value">${{formattedAmount}}</div>
-            </div>
-            <div id="payment-element"></div>
-            <button id="submit-button" disabled>Complete Purchase</button>
-            <div id="error-message"></div>
-            <div id="loading">Processing payment…</div>
-          </form>
-        </div>
+
+      <div id="email-section" style="margin-bottom: 24px;">
+        <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px;">Email</label>
+        <p style="font-size:13px;color:#888;margin-bottom:12px;">Used to re-download if you ever lose access. Enter the same email to access your purchase again.</p>
+        <input id="buyer-email" type="email" placeholder="you@example.com" autocomplete="email"
+          style="width:100%;background:#1a1a2e;border:1px solid #444;border-radius:8px;padding:11px 14px;color:#e8e8ea;font-size:14px;outline:none;transition:border-color 0.15s;"
+          onfocus="this.style.borderColor='#7ec8e3'" onblur="this.style.borderColor='#444'"
+          onkeydown="if(event.key==='Enter')proceedWithEmail()">
+        <div id="email-error" style="color:#ff6b6b;font-size:13px;margin-top:6px;display:none;"></div>
+        <button id="email-proceed-btn" onclick="proceedWithEmail()"
+          style="margin-top:12px;padding:11px 24px;background:linear-gradient(90deg,#0f3460,#7ec8e3);color:white;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">
+          Continue to Payment →
+        </button>
+      </div>
+
+      <div id="payment-section" style="display:none;">
+        <h3 style="margin-bottom:16px;">Payment Details</h3>
+        <form id="payment-form">
+          <div class="amount-display">
+            <div class="label">Total</div>
+            <div class="value">${{formattedAmount}}</div>
+          </div>
+          <div id="payment-element"></div>
+          <button id="submit-button" disabled>Complete Purchase</button>
+          <div id="error-message"></div>
+          <div id="loading">Processing payment…</div>
+        </form>
       </div>
     </div>
   </div>
@@ -513,19 +521,16 @@
 </script>
 
 <script>
-  // Legacy path: buy button reveals the recovery key form
-  function validateAllForms() {
+  function validatePaymentReady() {
     const paymentValid = typeof stripe !== 'undefined' && typeof elements !== 'undefined';
     const btn = document.getElementById('submit-button');
     if (!btn) return;
     if (paymentValid) {
       btn.classList.add('ready');
       btn.disabled = false;
-      btn.textContent = 'Complete Purchase';
     } else {
       btn.classList.remove('ready');
       btn.disabled = true;
-      btn.textContent = 'Complete Purchase';
     }
   }
 
@@ -537,21 +542,25 @@
     });
   }
 
-  const formConfig = {
-    'Recovery': { type: 'text', required: true },
-    'Explanation': { type: 'text-block', content: 'Put whatever you want here, but make sure you remember it. This is how you\'ll be able to download this again.' }
-  };
-
-  async function handleSubmit(formData) {
-    window.formData = formData;
-    const recoveryKey = formData.Recovery;
+  window.proceedWithEmail = async function() {
+    const email = document.getElementById('buyer-email').value.trim();
+    const errEl = document.getElementById('email-error');
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      errEl.textContent = 'Please enter a valid email address.';
+      errEl.style.display = 'block';
+      return;
+    }
+    errEl.style.display = 'none';
+    document.getElementById('email-proceed-btn').disabled = true;
+    document.getElementById('email-proceed-btn').textContent = 'Checking…';
+    window.buyerEmail = email;
 
     try {
       const resp = await fetch('/plugin/agora/{{tenantUuid}}/purchase/intent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          recoveryKey,
+          recoveryKey: email,
           productId: '{{productId}}',
           title: {{title_json}},
           ...(URL_PAYEES && { payees: URL_PAYEES })
@@ -560,25 +569,30 @@
       const json = await resp.json();
 
       if (json.purchased) { window.location.href = '{{ebookUrl}}'; return; }
-      if (json.error) { alert('Error: ' + json.error); return; }
+      if (json.error) {
+        errEl.textContent = json.error;
+        errEl.style.display = 'block';
+        document.getElementById('email-proceed-btn').disabled = false;
+        document.getElementById('email-proceed-btn').textContent = 'Continue to Payment →';
+        return;
+      }
 
+      document.getElementById('email-section').style.display = 'none';
       window.clientSecret = json.clientSecret;
       document.getElementById('payment-section').style.display = 'block';
       stripe = Stripe(json.publishableKey);
       elements = stripe.elements({ clientSecret: json.clientSecret });
       const payEl = elements.create('payment');
       payEl.mount('#payment-element');
-      payEl.on('ready', () => setTimeout(validateAllForms, 500));
-      payEl.on('change', () => setTimeout(validateAllForms, 100));
+      payEl.on('ready', () => setTimeout(validatePaymentReady, 500));
+      payEl.on('change', () => setTimeout(validatePaymentReady, 100));
     } catch (err) {
-      alert('Unexpected error: ' + err.message);
+      errEl.textContent = 'Unexpected error. Please try again.';
+      errEl.style.display = 'block';
+      document.getElementById('email-proceed-btn').disabled = false;
+      document.getElementById('email-proceed-btn').textContent = 'Continue to Payment →';
     }
-  }
-
-  if (!IS_SHOPPERE) {
-    const form = getForm(formConfig, handleSubmit);
-    document.getElementById('address-form').appendChild(form);
-  }
+  };
 </script>
 
 <script>
@@ -598,9 +612,10 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          recoveryKey: window.formData?.Recovery,
+          recoveryKey: window.buyerEmail,
           productId: '{{productId}}',
-          paymentIntentId
+          paymentIntentId,
+          contactInfo: { email: window.buyerEmail }
         })
       });
       const json = await resp.json();

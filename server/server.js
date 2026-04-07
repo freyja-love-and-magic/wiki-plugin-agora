@@ -112,6 +112,35 @@ function getAddieUrl() {
   return `http://localhost:${process.env.ADDIE_PORT || 3005}`;
 }
 
+function getMinnieUrl() {
+  const sanora = getSanoraUrl();
+  try {
+    const url = new URL(sanora);
+    if (url.pathname && url.pathname !== '/') {
+      return url.origin + '/plugin/allyabase/minnie';
+    }
+  } catch { /* fall through */ }
+  return `http://localhost:${process.env.MINNIE_PORT || 2525}`;
+}
+
+async function sendEmail({ to, subject, html, text, from }) {
+  const minnieUrl = getMinnieUrl();
+  try {
+    await fetch(`${minnieUrl}/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to, subject, html, text, from }),
+    });
+  } catch (err) {
+    console.warn('[agora] email send failed:', err.message);
+  }
+}
+
+function notifyTenant(tenant, subject, html, text) {
+  if (!tenant.email) return;
+  sendEmail({ to: tenant.email, subject, html, text });
+}
+
 // Returns the public-facing Sanora URL for browser-visible resource URLs (images, artifacts).
 // When sanora is configured as a full proxy URL (e.g. https://dev.allyabase.com/plugin/allyabase/sanora),
 // use it directly — it's already publicly accessible.
@@ -1026,6 +1055,11 @@ async function lucilleUploadVideo(tenant, title, fileBuffer, filename, lucilleUr
 // Each job buffers SSE events so the client can replay them if it connects late.
 const uploadJobs = new Map(); // jobId → { sse: res|null, queue: [], done: false }
 
+// Canimus feed cache: tenantUuid → { xml: string, expiresAt: number }
+const canimusFeedCache = new Map();
+// Canimus JSON feed cache: tenantUuid → { json: object, expiresAt: number }
+const canimusJsonCache = new Map();
+
 function countItems(root) {
   let count = 0;
 
@@ -1129,6 +1163,15 @@ async function processArchive(zipPath, onProgress = () => {}) {
     if (manifest.affiliateCommission != null && typeof manifest.affiliateCommission === 'number') {
       // Clamp to [0, 0.50] — affiliates can earn at most 50% commission
       tenantUpdates.affiliateCommission = Math.max(0, Math.min(0.50, manifest.affiliateCommission));
+    }
+    if (Array.isArray(manifest.sections) && manifest.sections.length > 0) {
+      tenantUpdates.sections = manifest.sections;
+    }
+    if (manifest.email && typeof manifest.email === 'string') {
+      tenantUpdates.email = manifest.email.trim();
+    }
+    if (manifest.description && typeof manifest.description === 'string') {
+      tenantUpdates.description = manifest.description.trim();
     }
     if (Object.keys(tenantUpdates).length > 0) {
       const tenants = loadTenants();
@@ -1917,27 +1960,54 @@ function fmtDate(ts) {
   return new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
-function generateOrdersHTML(tenant, orderData) {
+function generateOrdersHTML(tenant, orderData, authQuery = {}) {
   const totalOrders  = orderData.reduce((n, p) => n + p.orders.length, 0);
   const totalRevenue = orderData.reduce((n, p) =>
     n + p.orders.reduce((m, o) => m + (o.amount || p.product.price || 0), 0), 0);
 
   const sections = orderData.map(({ product, orders }) => {
     const emoji = CATEGORY_EMOJI[product.category] || '🛍️';
+    const isPhysical = product.category === 'product' && product.shipping > 0;
+
     const rows = orders.map(o => {
       const date   = fmtDate(o.paidAt || o.createdAt || Date.now());
       const amount = o.amount != null ? `$${(o.amount / 100).toFixed(2)}` : `$${((product.price || 0) / 100).toFixed(2)}`;
-      const detail = o.slot
-        ? `<span class="tag">📅 ${o.slot}</span>`
-        : o.renewalDays
-          ? `<span class="tag">🔄 ${o.renewalDays}d renewal</span>`
-          : '';
-      const keyHint = o.orderKey
-        ? `<span class="hash" title="sha256(recoveryKey+productId)">${o.orderKey.slice(0, 12)}…</span>`
-        : '—';
-      return `<tr><td>${date}</td><td>${amount}</td><td>${keyHint}</td><td>${detail}</td></tr>`;
+
+      let detail = '';
+      if (o.slot) {
+        detail += `<span class="tag">📅 ${escHtml(o.slot)}</span> `;
+      } else if (o.renewalDays) {
+        detail += `<span class="tag">🔄 ${o.renewalDays}d renewal</span> `;
+      }
+
+      // Contact / shipping info
+      let contactHtml = '';
+      if (o.contactInfo?.email) contactHtml += `<div class="contact-row">✉️ ${escHtml(o.contactInfo.email)}</div>`;
+      if (o.contactInfo?.name)  contactHtml += `<div class="contact-row">👤 ${escHtml(o.contactInfo.name)}</div>`;
+      if (o.shippingAddress) {
+        const a = o.shippingAddress;
+        contactHtml += `<div class="contact-row">📦 ${escHtml(a.recipientName)}, ${escHtml(a.street)}${a.street2 ? ' ' + escHtml(a.street2) : ''}, ${escHtml(a.city)}, ${escHtml(a.state)} ${escHtml(a.zip)}</div>`;
+      }
+
+      // Status badge + ship button for physical orders
+      let statusHtml = '';
+      if (isPhysical && o.orderId) {
+        const shipped = o.status === 'shipped';
+        statusHtml = shipped
+          ? `<span class="status-shipped">✅ Shipped</span>`
+          : `<button class="ship-btn" onclick="markShipped('${escHtml(product.productId)}','${escHtml(o.orderId)}',this)">Mark shipped</button>`;
+      }
+
+      return `<tr>
+        <td>${date}</td>
+        <td>${amount}</td>
+        <td>${detail || '—'}</td>
+        <td>${contactHtml || '—'}</td>
+        <td>${statusHtml}</td>
+      </tr>`;
     }).join('');
 
+    const hasContact = orders.some(o => o.contactInfo?.email || o.contactInfo?.name || o.shippingAddress);
     return `
     <div class="product-section">
       <div class="product-header">
@@ -1946,7 +2016,7 @@ function generateOrdersHTML(tenant, orderData) {
         <span class="order-count">${orders.length} order${orders.length !== 1 ? 's' : ''}</span>
       </div>
       <table>
-        <thead><tr><th>Date</th><th>Amount</th><th>Key hash</th><th>Details</th></tr></thead>
+        <thead><tr><th>Date</th><th>Amount</th><th>Details</th><th>Contact</th><th>Status</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>`;
@@ -1954,6 +2024,10 @@ function generateOrdersHTML(tenant, orderData) {
 
   const empty = totalOrders === 0
     ? '<p class="empty">No orders yet. Share your agora link to get started!</p>'
+    : '';
+
+  const authParams = authQuery.timestamp && authQuery.signature
+    ? `?timestamp=${encodeURIComponent(authQuery.timestamp)}&signature=${encodeURIComponent(authQuery.signature)}`
     : '';
 
   return `<!DOCTYPE html>
@@ -1968,11 +2042,11 @@ function generateOrdersHTML(tenant, orderData) {
     header { background: linear-gradient(135deg, #1a1a2e, #0f3460); padding: 36px 32px 28px; }
     header h1 { font-size: 26px; font-weight: 700; margin-bottom: 4px; }
     header p  { font-size: 14px; color: #aaa; }
-    .stats { display: flex; gap: 20px; padding: 24px 32px; border-bottom: 1px solid #222; }
+    .stats { display: flex; gap: 20px; padding: 24px 32px; border-bottom: 1px solid #222; flex-wrap: wrap; }
     .stat { background: #18181c; border: 1px solid #333; border-radius: 12px; padding: 16px 24px; }
     .stat-val { font-size: 28px; font-weight: 800; color: #7ec8e3; }
     .stat-lbl { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
-    .main { max-width: 900px; margin: 0 auto; padding: 28px 24px 60px; }
+    .main { max-width: 1000px; margin: 0 auto; padding: 28px 24px 60px; }
     .product-section { margin-bottom: 32px; }
     .product-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
     .product-emoji { font-size: 20px; }
@@ -1981,19 +2055,22 @@ function generateOrdersHTML(tenant, orderData) {
     table { width: 100%; border-collapse: collapse; background: #18181c; border: 1px solid #2a2a2e; border-radius: 12px; overflow: hidden; }
     thead { background: #222; }
     th { padding: 10px 14px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #888; text-align: left; }
-    td { padding: 11px 14px; font-size: 13px; border-top: 1px solid #222; }
-    .hash { font-family: monospace; font-size: 12px; color: #7ec8e3; }
+    td { padding: 11px 14px; font-size: 13px; border-top: 1px solid #222; vertical-align: top; }
     .tag  { background: #2a2a2e; border-radius: 6px; padding: 2px 8px; font-size: 12px; color: #ccc; }
+    .contact-row { font-size: 12px; color: #aaa; margin-bottom: 3px; }
+    .status-shipped { font-size: 12px; color: #5d9; }
+    .ship-btn { padding: 5px 12px; background: #0f3460; color: #7ec8e3; border: 1px solid #7ec8e3; border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+    .ship-btn:hover { background: #1a4070; }
+    .ship-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .empty { color: #555; font-size: 15px; text-align: center; padding: 60px 0; }
     .back { display: inline-block; margin-bottom: 20px; color: #7ec8e3; text-decoration: none; font-size: 13px; }
     .back:hover { text-decoration: underline; }
-    .warning { background: #2a1f0a; border: 1px solid #665; border-radius: 10px; padding: 12px 16px; font-size: 13px; color: #cc9; margin-bottom: 24px; }
   </style>
 </head>
 <body>
   <header>
     <h1>${escHtml(tenant.emojicode)} ${escHtml(tenant.name)}</h1>
-    <p>Order history — this URL is valid for 5 minutes</p>
+    <p>Order history</p>
   </header>
   <div class="stats">
     <div class="stat"><div class="stat-val">${totalOrders}</div><div class="stat-lbl">Total orders</div></div>
@@ -2002,10 +2079,32 @@ function generateOrdersHTML(tenant, orderData) {
   </div>
   <div class="main">
     <a class="back" href="/plugin/agora/${tenant.uuid}">← Back to agora</a>
-    <div class="warning">🔑 Key hashes are shown (not recovery keys — those never reach this server). Revenue totals are approximate when order amounts aren't stored.</div>
     ${empty}
     ${sections}
   </div>
+  <script>
+    async function markShipped(productId, orderId, btn) {
+      btn.disabled = true;
+      btn.textContent = 'Shipping…';
+      try {
+        const resp = await fetch('/plugin/agora/${tenant.uuid}/orders/' + encodeURIComponent(productId) + '/' + encodeURIComponent(orderId) + '/ship${authParams}', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }
+        });
+        const data = await resp.json();
+        if (data.success) {
+          btn.replaceWith(Object.assign(document.createElement('span'), { className: 'status-shipped', textContent: '✅ Shipped' }));
+        } else {
+          btn.disabled = false;
+          btn.textContent = 'Mark shipped';
+          alert(data.error || 'Failed to update order.');
+        }
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = 'Mark shipped';
+        alert('Network error. Please try again.');
+      }
+    }
+  </script>
 </body>
 </html>`;
 }
@@ -2065,32 +2164,105 @@ function renderCards(items, category) {
   }).join('');
 }
 
-function generateAgoraHTML(tenant, goods, uploadAuth = null) {
-  const total = Object.values(goods).flat().length;
-  const tabs = [
-    { id: 'all',          label: 'All',              count: total,                       always: true },
-    { id: 'books',        label: '📚 Books',          count: goods.books.length },
-    { id: 'music',        label: '🎵 Music',          count: goods.music.length },
-    { id: 'posts',        label: '📝 Posts',          count: goods.posts.length },
-    { id: 'albums',       label: '🖼️ Albums',         count: goods.albums.length },
-    { id: 'products',     label: '📦 Products',       count: goods.products.length },
-    { id: 'videos',        label: '🎬 Videos',         count: goods.videos.length },
-    { id: 'appointments',  label: '📅 Appointments',  count: goods.appointments.length },
-    { id: 'subscriptions', label: '🎁 Infuse',          count: goods.subscriptions.length }
-  ]
-    .filter(t => t.always || t.count > 0)
-    .map((t, i) => `<div class="tab${i === 0 ? ' active' : ''}" onclick="show('${t.id}',this)">${t.label} <span class="badge">${t.count}</span></div>`)
-    .join('');
+function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
+  const SECTION_META = {
+    books:         { label: '📚 Books',        noun: 'book' },
+    music:         { label: '🎵 Music',         noun: 'item' },
+    posts:         { label: '📝 Posts',         noun: 'post' },
+    albums:        { label: '🖼️ Albums',        noun: 'album' },
+    products:      { label: '📦 Products',      noun: 'product' },
+    videos:        { label: '🎬 Videos',        noun: 'video' },
+    appointments:  { label: '📅 Appointments',  noun: 'appointment' },
+    subscriptions: { label: '🎁 Infuse',        noun: 'tier' },
+  };
+  const goodsMap = {
+    books: goods.books, music: goods.music, posts: goods.posts,
+    albums: goods.albums, products: goods.products, videos: goods.videos,
+    appointments: goods.appointments, subscriptions: goods.subscriptions,
+  };
 
-  const allItems = [...goods.books, ...goods.music, ...goods.posts, ...goods.albums, ...goods.products, ...goods.videos, ...goods.appointments, ...goods.subscriptions];
+  // Determine section order: use manifest sections list if provided, else all with content.
+  const allSectionIds = Object.keys(SECTION_META);
+  const orderedSections = (Array.isArray(tenant.sections) && tenant.sections.length > 0
+    ? tenant.sections.filter(id => SECTION_META[id])
+    : allSectionIds
+  ).filter(id => goodsMap[id]?.length > 0);
+
+  // Home landing cards — one tile per section
+  const homeCards = orderedSections.map(id => {
+    const meta   = SECTION_META[id];
+    const items  = goodsMap[id];
+    const cover  = items[0]?.image;
+    const emoji  = meta.label.split(' ')[0];
+    const count  = items.length;
+    const noun   = count === 1 ? meta.noun : meta.noun + 's';
+    return `<div class="home-card" onclick="show('${id}',document.querySelector('.tab[data-id=${id}]'))">
+      <div class="home-card-img${cover ? '' : ' home-card-no-img'}"${cover ? ` style="background-image:url('${cover}')"` : ''}>${cover ? '' : `<span>${emoji}</span>`}</div>
+      <div class="home-card-body">
+        <div class="home-card-title">${meta.label}</div>
+        <div class="home-card-count">${count} ${noun}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Nav tabs: Home + one per ordered section
+  const tabs = [
+    `<div class="tab active" data-id="home" onclick="show('home',this)">🏠 Home</div>`,
+    ...orderedSections.map(id => {
+      const meta = SECTION_META[id];
+      return `<div class="tab" data-id="${id}" onclick="show('${id}',this)">${meta.label} <span class="badge">${goodsMap[id].length}</span></div>`;
+    })
+  ].join('');
+
+  // ── Social / OG meta ──────────────────────────────────────────────────────
+  // Description: use manifest.description if set, else auto-generate from sections
+  const ogDescription = (() => {
+    if (tenant.description) return tenant.description;
+    const sectionLabels = orderedSections.map(id => SECTION_META[id].noun + 's');
+    if (sectionLabels.length === 0) return `Visit ${tenant.name}'s agora.`;
+    const listed = sectionLabels.length <= 2
+      ? sectionLabels.join(' and ')
+      : sectionLabels.slice(0, -1).join(', ') + ', and ' + sectionLabels[sectionLabels.length - 1];
+    return `${tenant.name} — ${listed} and more. Available now.`;
+  })();
+
+  // Cover image: first image across sections in priority order
+  const ogImage = (() => {
+    for (const id of ['books', 'music', 'products', 'albums', 'subscriptions', 'appointments', 'posts', 'videos']) {
+      const img = goodsMap[id]?.[0]?.image;
+      if (img) return img;
+    }
+    return '';
+  })();
+
+  const ogMeta = `
+  <!-- Primary meta -->
+  <meta name="description" content="${escHtml(ogDescription)}">
+  ${tenant.keywords ? `<meta name="keywords" content="${escHtml(tenant.keywords)}">` : ''}
+
+  <!-- Open Graph -->
+  <meta property="og:type"        content="website">
+  <meta property="og:site_name"   content="${escHtml(tenant.name)}">
+  <meta property="og:title"       content="${escHtml(tenant.name)}">
+  <meta property="og:description" content="${escHtml(ogDescription)}">
+  ${pageUrl  ? `<meta property="og:url"         content="${escHtml(pageUrl)}">` : ''}
+  ${ogImage  ? `<meta property="og:image"        content="${escHtml(ogImage)}">
+  <meta property="og:image:width"  content="1200">
+  <meta property="og:image:height" content="630">` : ''}
+
+  <!-- Twitter / X -->
+  <meta name="twitter:card"        content="${ogImage ? 'summary_large_image' : 'summary'}">
+  <meta name="twitter:title"       content="${escHtml(tenant.name)}">
+  <meta name="twitter:description" content="${escHtml(ogDescription)}">
+  ${ogImage ? `<meta name="twitter:image"       content="${escHtml(ogImage)}">` : ''}`;
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${tenant.name}</title>
-  ${tenant.keywords ? `<meta name="keywords" content="${escHtml(tenant.keywords)}">` : ''}
+  <title>${escHtml(tenant.name)}</title>
+  ${ogMeta}
   <script>
     const _agoraId   = ${JSON.stringify(tenant.uuid)};
     const _agoraName = ${JSON.stringify(tenant.name)};
@@ -2175,6 +2347,14 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null) {
     main { max-width: 1200px; margin: 0 auto; padding: 36px 24px; }
     .section { display: none; }
     .section.active { display: block; }
+    .home-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 20px; }
+    .home-card { background: var(--card-bg); border-radius: 16px; overflow: hidden; cursor: pointer; box-shadow: 0 2px 8px var(--shadow); transition: transform 0.18s, box-shadow 0.18s; }
+    .home-card:hover { transform: translateY(-4px); box-shadow: 0 10px 28px var(--shadow-hover); }
+    .home-card-img { width: 100%; aspect-ratio: 1; background: var(--placeholder) center/cover no-repeat; }
+    .home-card-no-img { background: var(--card-bg-2); display: flex; align-items: center; justify-content: center; font-size: 52px; }
+    .home-card-body { padding: 14px 16px; }
+    .home-card-title { font-size: 15px; font-weight: 700; margin-bottom: 3px; }
+    .home-card-count { font-size: 13px; color: var(--text-3); }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 20px; }
     .card { background: var(--card-bg); border-radius: 14px; overflow: hidden; box-shadow: 0 2px 8px var(--shadow); cursor: pointer; transition: transform 0.18s, box-shadow 0.18s; }
     .card:hover { transform: translateY(-3px); box-shadow: 0 8px 24px var(--shadow-hover); }
@@ -2331,7 +2511,7 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null) {
   </header>
   <nav>${tabs}</nav>
   <main>
-    <div id="all" class="section active"><div class="grid">${renderCards(allItems, 'all')}</div></div>
+    <div id="home" class="section active"><div class="home-grid">${homeCards}</div></div>
     <div id="books" class="section"><div class="grid">${renderCards(goods.books, 'book')}</div></div>
     <div id="music" class="section">
       <div id="music-album-grid"></div>
@@ -2358,7 +2538,7 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null) {
     <div id="subscriptions" class="section">
       <div id="subscriptions-list"></div>
       <div style="text-align:center;padding:12px 0 8px;font-size:13px;color:#888;">
-        Already infusing? <a href="/plugin/agora/${tenant.uuid}/membership" style="color:#0066cc;">Access your membership →</a>
+        Already infusing? <a href="/plugin/agora/${tenant.uuid}/membership" style="color:#0066cc;">Access your membership with your email →</a>
       </div>
     </div>
   </main>
@@ -2685,11 +2865,11 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null) {
               <p id="sub-already-desc-\${i}"></p>
             </div>
             <div id="sub-recovery-\${i}">
-              <div class="sub-recovery-note">🔑 Choose a recovery key — a word or phrase only you know. You'll use it every time you want to access your membership benefits.</div>
               <div class="sub-field-group">
-                <label>Recovery Key *</label>
-                <input type="text" id="sub-rkey-\${i}" placeholder="e.g. golden-ticket-2026" autocomplete="off">
+                <label>Email *</label>
+                <input type="email" id="sub-rkey-\${i}" placeholder="you@example.com" autocomplete="email">
               </div>
+              <div class="sub-recovery-note" style="margin-top:6px;">You'll use this email to access your membership benefits at the portal.</div>
               <button class="sub-btn" onclick="subProceed(\${i})">Continue to Payment →</button>
               <div id="sub-rkey-error-\${i}" class="sub-error"></div>
             </div>
@@ -2705,7 +2885,7 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null) {
                 <div class="icon">🎉</div>
                 <h3>Thank you for infusing!</h3>
                 <div class="renews" id="sub-confirm-renews-\${i}"></div>
-                <p style="font-size:13px;color:#888;margin:8px 0 14px;">Use your recovery key at the <a href="/plugin/agora/${tenant.uuid}/membership" style="color:#0066cc;">membership portal</a> to access exclusive content.</p>
+                <p style="font-size:13px;color:#888;margin:8px 0 14px;">Use your email at the <a href="/plugin/agora/${tenant.uuid}/membership" style="color:#0066cc;">membership portal</a> to access exclusive content.</p>
               </div>
             </div>
           </div>
@@ -2726,7 +2906,7 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null) {
       const tier = _subsData[i];
       const recoveryKey = document.getElementById(\`sub-rkey-\${i}\`).value.trim();
       const errEl = document.getElementById(\`sub-rkey-error-\${i}\`);
-      if (!recoveryKey) { errEl.textContent = 'Recovery key is required.'; errEl.style.display = 'block'; return; }
+      if (!recoveryKey || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(recoveryKey)) { errEl.textContent = 'A valid email is required.'; errEl.style.display = 'block'; return; }
       errEl.style.display = 'none';
       try {
         const resp = await fetch('/plugin/agora/${tenant.uuid}/purchase/intent', {
@@ -2769,7 +2949,7 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null) {
         const paymentIntentId = _subClientSecrets[i] ? _subClientSecrets[i].split('_secret_')[0] : undefined;
         await fetch('/plugin/agora/${tenant.uuid}/purchase/complete', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ recoveryKey, productId: tier.productId, title: tier.title, amount: tier.price, type: 'subscription', renewalDays: tier.renewalDays || 30, paymentIntentId })
+          body: JSON.stringify({ recoveryKey, productId: tier.productId, title: tier.title, amount: tier.price, type: 'subscription', renewalDays: tier.renewalDays || 30, paymentIntentId, contactInfo: { email: recoveryKey } })
         });
         document.getElementById(\`sub-payment-\${i}\`).style.display = 'none';
         const conf = document.getElementById(\`sub-confirm-\${i}\`);
@@ -2825,8 +3005,6 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null) {
             </div>
             <div id="appt-form-\${i}" style="display:none">
               <div id="appt-slot-display-\${i}" class="appt-selected-slot"></div>
-              <div class="sub-recovery-note">🔑 Choose a recovery key — you'll use it to look up your booking later.</div>
-              <div class="sub-field-group"><label>Recovery Key *</label><input type="text" id="appt-rkey-\${i}" placeholder="e.g. sunflower-2026" autocomplete="off"></div>
               <div class="sub-field-group"><label>Your Name *</label><input type="text" id="appt-name-\${i}" placeholder="Full name"></div>
               <div class="sub-field-group"><label>Email *</label><input type="email" id="appt-email-\${i}" placeholder="For booking confirmation"></div>
               <div style="display:flex;gap:10px;margin-top:6px;flex-wrap:wrap;">
@@ -2847,7 +3025,7 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null) {
                 <div class="icon">✅</div>
                 <h3>You're booked!</h3>
                 <div class="slot-label" id="appt-confirm-slot-\${i}"></div>
-                <p style="font-size:12px;color:#888;margin-top:8px;">Keep your recovery key safe — it's how you look up this booking.</p>
+                <p style="font-size:12px;color:#888;margin-top:8px;">A confirmation has been sent to your email.</p>
               </div>
             </div>
           </div>
@@ -2962,15 +3140,14 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null) {
 
     async function apptProceed(i) {
       const appt = _apptsData[i];
-      const recoveryKey = document.getElementById(\`appt-rkey-\${i}\`).value.trim();
       const name = document.getElementById(\`appt-name-\${i}\`).value.trim();
       const email = document.getElementById(\`appt-email-\${i}\`).value.trim();
       const errEl = document.getElementById(\`appt-form-error-\${i}\`);
       const selectedSlot = _apptState[i] && _apptState[i].selectedSlot;
-      if (!recoveryKey) { errEl.textContent = 'Recovery key is required.'; errEl.style.display = 'block'; return; }
       if (!name) { errEl.textContent = 'Name is required.'; errEl.style.display = 'block'; return; }
       if (!email) { errEl.textContent = 'Email is required.'; errEl.style.display = 'block'; return; }
       if (!selectedSlot) { errEl.textContent = 'Please select a time slot.'; errEl.style.display = 'block'; return; }
+      const recoveryKey = email;
       errEl.style.display = 'none';
       document.getElementById(\`appt-proceed-btn-\${i}\`).disabled = true;
       try {
@@ -3016,9 +3193,9 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null) {
           elements: _apptElems[i], confirmParams: { return_url: window.location.href }, redirect: 'if_required'
         });
         if (error) { payError.textContent = error.message; payError.style.display = 'block'; payBtn.disabled = false; payLoading.style.display = 'none'; return; }
-        const recoveryKey = document.getElementById(\`appt-rkey-\${i}\`).value.trim();
         const name = document.getElementById(\`appt-name-\${i}\`).value.trim();
         const email = document.getElementById(\`appt-email-\${i}\`).value.trim();
+        const recoveryKey = email;
         const selectedSlot = _apptState[i] && _apptState[i].selectedSlot;
         const paymentIntentId = _apptSecrets[i] ? _apptSecrets[i].split('_secret_')[0] : undefined;
         await fetch('/plugin/agora/${tenant.uuid}/purchase/complete', {
@@ -3299,6 +3476,11 @@ async function startServer(params) {
     processArchive(zipPath, emit)
       .then(result => {
         emit('complete', { success: true, ...result });
+        // Bust the Canimus feed caches so re-uploads are reflected immediately
+        if (result.tenant && result.tenant.uuid) {
+          canimusFeedCache.delete(result.tenant.uuid);
+          canimusJsonCache.delete(result.tenant.uuid);
+        }
         // Update the wiki catalog page for federation search (fire-and-forget)
         const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
         writeAgoraWikiPage(req, result.tenant, wikiOrigin).catch(err =>
@@ -3619,10 +3801,64 @@ async function startServer(params) {
 
       const orderData = await getAllOrders(tenant);
       res.set('Content-Type', 'text/html');
-      res.send(generateOrdersHTML(tenant, orderData));
+      res.send(generateOrdersHTML(tenant, orderData, { timestamp: req.query.timestamp, signature: req.query.signature }));
     } catch (err) {
       console.error('[agora] orders page error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
+    }
+  });
+
+  // Mark a physical product order as shipped — owner auth required
+  app.post('/plugin/agora/:uuid/orders/:productId/:orderId/ship', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.uuid);
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
+
+      const err = checkOwnerSignature(req, tenant, 60 * 60 * 1000); // 1-hour window
+      if (err) return res.status(403).json({ error: err });
+
+      const { productId, orderId } = req.params;
+      const sanoraUrl = getSanoraUrl();
+
+      // Fetch the orders for this product, find the one to update
+      const timestamp = Date.now().toString();
+      const signature = signMessage(timestamp + tenant.uuid, tenant.keys.privateKey);
+      const resp = await fetch(
+        `${sanoraUrl}/user/${tenant.uuid}/orders/${encodeURIComponent(productId)}?timestamp=${timestamp}&signature=${encodeURIComponent(signature)}`
+      );
+      if (!resp.ok) return res.status(404).json({ error: 'Orders not found' });
+      const data = await resp.json();
+      const order = (data.orders || []).find(o => o.orderId === orderId);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+      if (order.status === 'shipped') return res.json({ success: true, alreadyShipped: true });
+
+      // Update status and save back
+      order.status = 'shipped';
+      order.shippedAt = Date.now();
+      const ts2 = Date.now().toString();
+      const sig2 = signMessage(ts2 + tenant.uuid, tenant.keys.privateKey);
+      await fetch(`${sanoraUrl}/user/${tenant.uuid}/orders`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timestamp: ts2, signature: sig2, order })
+      });
+
+      // Notify buyer if we have their email
+      const buyerEmail = order.contactInfo?.email || order.shippingAddress?.email;
+      if (buyerEmail) {
+        const name = order.shippingAddress?.recipientName || 'there';
+        sendEmail({
+          to: buyerEmail,
+          subject: `Your order has shipped: ${order.title}`,
+          html: `<p>Hi ${escHtml(name)},</p><p>Great news — your order for <strong>${escHtml(order.title)}</strong> has shipped!</p><p>Thank you for your purchase.</p>`,
+          text: `Hi ${name},\n\nYour order for "${order.title}" has shipped!\n\nThank you for your purchase.`,
+        });
+      }
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error('[agora] mark-shipped error:', err);
+      res.status(500).json({ error: err.message });
     }
   });
 
@@ -3716,7 +3952,9 @@ async function startServer(params) {
     if (!tenant) return res.status(404).send('<h1>Agora not found</h1>');
     const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
     const agoraUrl = `${wikiOrigin}/plugin/agora/${tenant.uuid}`;
-    const html = fillTemplate(SUBSCRIPTION_MEMBERSHIP_TMPL, { agoraUrl, tenantUuid: tenant.uuid });
+    // Restore email from session if available for this agora
+    const sessionEmail = req.session?.agoraMembership?.[tenant.uuid] || '';
+    const html = fillTemplate(SUBSCRIPTION_MEMBERSHIP_TMPL, { agoraUrl, tenantUuid: tenant.uuid, sessionEmail });
     res.set('Content-Type', 'text/html');
     res.send(html);
   });
@@ -3731,6 +3969,7 @@ async function startServer(params) {
       if (!recoveryKey) return res.status(400).json({ error: 'recoveryKey required' });
 
       const sanoraUrl = getSanoraUrl();
+      const sanoraPublicUrl = getSanoraPublicUrl(req);
       const productsResp = await fetch(`${sanoraUrl}/products/${tenant.uuid}`);
       const products = await productsResp.json();
       const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
@@ -3749,7 +3988,7 @@ async function startServer(params) {
         const exclusiveArtifacts = status.active
           ? (product.artifacts || [])
               .filter(a => !a.endsWith('.json'))
-              .map(a => ({ name: a.split('-').slice(1).join('-'), url: `${sanoraUrl}/artifacts/${a}` }))
+              .map(a => ({ name: a.split('-').slice(1).join('-'), url: `${sanoraPublicUrl}/artifacts/${a}` }))
           : [];
 
         subscriptions.push({
@@ -3766,6 +4005,12 @@ async function startServer(params) {
           exclusiveArtifacts,
           subscribeUrl:       `${agoraUrl}/subscribe/${encodeURIComponent(product.title || title)}`
         });
+      }
+
+      // Persist email in session so the portal pre-fills on next visit
+      if (recoveryKey && req.session) {
+        req.session.agoraMembership = req.session.agoraMembership || {};
+        req.session.agoraMembership[tenant.uuid] = recoveryKey;
       }
 
       res.json({ subscriptions });
@@ -3977,6 +4222,9 @@ async function startServer(params) {
           body: JSON.stringify({ timestamp: ts, signature: sig, order })
         });
         triggerTransfer();
+        notifyTenant(tenant, `New subscription: ${title}`,
+          `<p>Someone just subscribed to <strong>${title}</strong> via Polites.</p>`,
+          `New subscription: "${title}" via Polites.`);
         return res.json({ success: true });
       }
 
@@ -4001,6 +4249,21 @@ async function startServer(params) {
           body: JSON.stringify({ timestamp: bookingTimestamp, signature: bookingSignature, order })
         });
         triggerTransfer();
+
+        if (contactInfo && contactInfo.email) {
+          const slotDisplay = new Date(slotDatetime).toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'short' });
+          sendEmail({
+            to: contactInfo.email,
+            subject: `Booking confirmed: ${title}`,
+            html: `<p>Hi ${contactInfo.name || 'there'},</p><p>Your appointment for <strong>${title}</strong> on <strong>${slotDisplay}</strong> has been confirmed.</p><p>Thank you!</p>`,
+            text: `Hi ${contactInfo.name || 'there'},\n\nYour appointment for "${title}" on ${slotDisplay} has been confirmed.\n\nThank you!`,
+          });
+        }
+        const slotDisplay = new Date(slotDatetime).toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'short' });
+        notifyTenant(tenant, `New booking: ${title}`,
+          `<p>New appointment booked for <strong>${title}</strong> on <strong>${slotDisplay}</strong>${contactInfo && contactInfo.name ? ` by ${contactInfo.name}` : ''}${contactInfo && contactInfo.email ? ` (${contactInfo.email})` : ''}.</p>`,
+          `New booking: "${title}" on ${slotDisplay}${contactInfo && contactInfo.name ? ` by ${contactInfo.name}` : ''}.`);
+
         return res.json({ success: true });
       }
 
@@ -4017,6 +4280,9 @@ async function startServer(params) {
           body: JSON.stringify({ timestamp: ts, signature: sig, order })
         });
         triggerTransfer();
+        notifyTenant(tenant, `New purchase: ${title}`,
+          `<p>Someone just purchased <strong>${title}</strong> via Polites.</p>`,
+          `New purchase: "${title}" via Polites.`);
         // Return a download URL for digital goods so the Polites app can open the content
         const sanoraUrl = getSanoraUrl();
         const products = await fetchWithRetry(`${sanoraUrl}/products/${tenant.uuid}`).then(r => r.ok ? r.json() : {});
@@ -4037,13 +4303,24 @@ async function startServer(params) {
         const tenantKeys = tenant.keys;
         const ts  = Date.now().toString();
         const sig = signMessage(ts + tenant.uuid, tenantKeys.privateKey);
-        const order = { orderKey, paidAt: Date.now(), title, productId, renewalDays: renewalDays || 30, status: 'active' };
+        const order = { orderKey, paidAt: Date.now(), title, productId, renewalDays: renewalDays || 30, status: 'active', contactInfo: contactInfo || {} };
         await fetch(`${sanoraUrlInternal}/user/${tenant.uuid}/orders`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ timestamp: ts, signature: sig, order })
         });
         triggerTransfer();
+        if (contactInfo && contactInfo.email) {
+          sendEmail({
+            to: contactInfo.email,
+            subject: `Subscription confirmed: ${title}`,
+            html: `<p>Thank you for subscribing to <strong>${title}</strong>! Your subscription is now active.</p><p>Use your email address at the membership portal to access exclusive content.</p>`,
+            text: `Thank you for subscribing to "${title}"! Your subscription is now active.\n\nUse your email address at the membership portal to access exclusive content.`,
+          });
+        }
+        notifyTenant(tenant, `New subscriber: ${title}`,
+          `<p>New subscription to <strong>${title}</strong>.</p>`,
+          `New subscriber for "${title}".`);
         return res.json({ success: true });
       }
 
@@ -4070,6 +4347,22 @@ async function startServer(params) {
           body: JSON.stringify({ timestamp: bookingTimestamp, signature: bookingSignature, order })
         });
         triggerTransfer();
+
+        // Send confirmation email to booker — fire and forget
+        if (contactInfo && contactInfo.email) {
+          const slotDisplay = new Date(slotDatetime).toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'short' });
+          sendEmail({
+            to: contactInfo.email,
+            subject: `Booking confirmed: ${title}`,
+            html: `<p>Hi ${contactInfo.name || 'there'},</p><p>Your appointment for <strong>${title}</strong> on <strong>${slotDisplay}</strong> has been confirmed.</p><p>Thank you!</p>`,
+            text: `Hi ${contactInfo.name || 'there'},\n\nYour appointment for "${title}" on ${slotDisplay} has been confirmed.\n\nThank you!`,
+          });
+        }
+        const slotDisplay2 = new Date(slotDatetime).toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'short' });
+        notifyTenant(tenant, `New booking: ${title}`,
+          `<p>New appointment booked for <strong>${title}</strong> on <strong>${slotDisplay2}</strong>${contactInfo && contactInfo.name ? ` by ${contactInfo.name}` : ''}${contactInfo && contactInfo.email ? ` (${contactInfo.email})` : ''}.</p>`,
+          `New booking: "${title}" on ${slotDisplay2}${contactInfo && contactInfo.name ? ` by ${contactInfo.name}` : ''}.`);
+
         return res.json({ success: true });
       }
 
@@ -4078,7 +4371,30 @@ async function startServer(params) {
         const recoveryHash = recoveryKey + productId;
         const createResp = await fetch(`${sanoraUrlInternal}/user/create-hash/${encodeURIComponent(recoveryHash)}/product/${encodeURIComponent(productId)}`);
         const createJson = await createResp.json();
+
+        // Record the purchase as an order
+        const tenantKeys = tenant.keys;
+        const ts  = Date.now().toString();
+        const sig = signMessage(ts + tenant.uuid, tenantKeys.privateKey);
+        const order = { orderKey: recoveryHash, paidAt: Date.now(), title, productId, status: 'purchased', contactInfo: contactInfo || {} };
+        await fetch(`${sanoraUrlInternal}/user/${tenant.uuid}/orders`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timestamp: ts, signature: sig, order })
+        });
+
         triggerTransfer();
+        if (contactInfo && contactInfo.email) {
+          sendEmail({
+            to: contactInfo.email,
+            subject: `Purchase confirmed: ${title}`,
+            html: `<p>Thank you for purchasing <strong>${title}</strong>!</p><p>Use your recovery key to download it again any time.</p>`,
+            text: `Thank you for purchasing "${title}"!\n\nUse your recovery key to download it again any time.`,
+          });
+        }
+        notifyTenant(tenant, `New purchase: ${title}`,
+          `<p>Someone just purchased <strong>${title}</strong>.</p>`,
+          `New purchase: "${title}".`);
         return res.json({ success: createJson.success });
       }
 
@@ -4110,6 +4426,9 @@ async function startServer(params) {
           body: JSON.stringify({ timestamp: orderTimestamp, signature: orderSignature, order })
         });
         triggerTransfer();
+        notifyTenant(tenant, `New order: ${title}`,
+          `<p>New physical product order for <strong>${title}</strong>. Shipping to ${escHtml(address.name)}, ${escHtml(address.city)}, ${escHtml(address.state)}.</p>`,
+          `New order: "${title}" — ships to ${address.name}, ${address.city}, ${address.state}.`);
         return res.json({ success: true });
       }
 
@@ -4459,11 +4778,12 @@ async function startServer(params) {
       if (!productsResp.ok) return res.status(502).json({ error: 'Could not load products' });
       const products = await productsResp.json();
 
+      const sanoraPublicUrl = getSanoraPublicUrl(req);
       const albums = [];
       const tracks = [];
       for (const [key, product] of Object.entries(products)) {
         if (product.category !== 'music') continue;
-        const cover = product.image ? `${getSanoraPublicUrl(req)}/images/${product.image}` : null;
+        const cover = product.image ? `${sanoraPublicUrl}/images/${product.image}` : null;
         const artifacts = product.artifacts || [];
         if (artifacts.length > 1) {
           albums.push({
@@ -4473,20 +4793,208 @@ async function startServer(params) {
             tracks: artifacts.map((a, i) => ({
               number: i + 1,
               title: `Track ${i + 1}`,
-              src: `${sanoraUrl}/artifacts/${a}`,
+              src: `${sanoraPublicUrl}/artifacts/${a}`,
               type: 'audio/mpeg'
             }))
           });
         } else if (artifacts.length === 1) {
           tracks.push({
             title: product.title || key,
-            src: `${sanoraUrl}/artifacts/${artifacts[0]}`,
+            src: `${sanoraPublicUrl}/artifacts/${artifacts[0]}`,
             cover,
             description: product.description || ''
           });
         }
       }
       res.json({ albums, tracks });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Canimus feed — RSS 2.0 + iTunes extensions for music distribution
+  app.get('/plugin/agora/:identifier/feed/canimus', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).send('Agora not found');
+
+      // Serve cached XML if still fresh
+      const cached = canimusFeedCache.get(tenant.uuid);
+      if (cached && cached.expiresAt > Date.now()) {
+        res.set('Content-Type', 'application/rss+xml; charset=utf-8');
+        res.set('X-Cache', 'HIT');
+        return res.send(cached.xml);
+      }
+
+      const sanoraUrl = getSanoraUrl();
+      const productsResp = await fetchWithRetry(`${sanoraUrl}/products/${tenant.uuid}`, { timeout: 15000 });
+      if (!productsResp.ok) return res.status(502).send('Could not load products');
+      const products = await productsResp.json();
+
+      const sanoraPublicUrl = getSanoraPublicUrl(req);
+      const xe = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+      const channelTitle = xe(tenant.name || 'Agora');
+      const channelDesc  = xe(tenant.description || `Music from ${tenant.name || 'this agora'}`);
+      const channelLink  = `${reqProto(req)}://${req.get('host')}/plugin/agora/${tenant.uuid}`;
+
+      const items = [];
+      for (const [key, product] of Object.entries(products)) {
+        if (product.category !== 'music') continue;
+        const cover     = product.image ? `${sanoraPublicUrl}/images/${product.image}` : null;
+        const artifacts = product.artifacts || [];
+        const albumName = xe(product.title || key);
+        const albumDesc = xe(product.description || '');
+
+        if (artifacts.length > 1) {
+          // Multi-track album — emit one <item> per track
+          artifacts.forEach((a, i) => {
+            const trackNum = i + 1;
+            const ext = (a.split('.').pop() || 'mp3').toLowerCase();
+            const mime = ext === 'flac' ? 'audio/flac'
+                       : ext === 'm4a'  ? 'audio/mp4'
+                       : ext === 'ogg'  ? 'audio/ogg'
+                       : ext === 'wav'  ? 'audio/wav'
+                       : 'audio/mpeg';
+            items.push([
+              `  <item>`,
+              `    <title>${albumName} — Track ${trackNum}</title>`,
+              `    <description>${albumDesc}</description>`,
+              `    <enclosure url="${xe(`${sanoraPublicUrl}/artifacts/${a}`)}" type="${mime}" length="0"/>`,
+              cover ? `    <itunes:image href="${xe(cover)}"/>` : '',
+              `    <itunes:author>${channelTitle}</itunes:author>`,
+              `    <itunes:order>${trackNum}</itunes:order>`,
+              `    <itunes:album>${albumName}</itunes:album>`,
+              `  </item>`
+            ].filter(Boolean).join('\n'));
+          });
+        } else if (artifacts.length === 1) {
+          const a    = artifacts[0];
+          const ext  = (a.split('.').pop() || 'mp3').toLowerCase();
+          const mime = ext === 'flac' ? 'audio/flac'
+                     : ext === 'm4a'  ? 'audio/mp4'
+                     : ext === 'ogg'  ? 'audio/ogg'
+                     : ext === 'wav'  ? 'audio/wav'
+                     : 'audio/mpeg';
+          items.push([
+            `  <item>`,
+            `    <title>${albumName}</title>`,
+            `    <description>${albumDesc}</description>`,
+            `    <enclosure url="${xe(`${sanoraPublicUrl}/artifacts/${a}`)}" type="${mime}" length="0"/>`,
+            cover ? `    <itunes:image href="${xe(cover)}"/>` : '',
+            `    <itunes:author>${channelTitle}</itunes:author>`,
+            `  </item>`
+          ].filter(Boolean).join('\n'));
+        }
+      }
+
+      // Find any cover image from the first music product for the channel
+      let channelCover = '';
+      for (const [, product] of Object.entries(products)) {
+        if (product.category === 'music' && product.image) {
+          channelCover = `    <itunes:image href="${xe(`${sanoraPublicUrl}/images/${product.image}`)}"/>`;
+          break;
+        }
+      }
+
+      const xml = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">',
+        '<channel>',
+        `  <title>${channelTitle}</title>`,
+        `  <description>${channelDesc}</description>`,
+        `  <link>${xe(channelLink)}</link>`,
+        channelCover,
+        `  <itunes:author>${channelTitle}</itunes:author>`,
+        ...items,
+        '</channel>',
+        '</rss>'
+      ].filter(Boolean).join('\n');
+
+      // Cache for 24 hours
+      canimusFeedCache.set(tenant.uuid, { xml, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+
+      res.set('Content-Type', 'application/rss+xml; charset=utf-8');
+      res.set('X-Cache', 'MISS');
+      res.send(xml);
+    } catch (err) {
+      res.status(500).send(`Error: ${err.message}`);
+    }
+  });
+
+  // Canimus JSON feed — application/canimus+json for the dolores audio player
+  app.get('/plugin/agora/:identifier/feed/canimus.json', async (req, res) => {
+    try {
+      const tenant = getTenantByIdentifier(req.params.identifier);
+      if (!tenant) return res.status(404).json({ error: 'Agora not found' });
+
+      const cached = canimusJsonCache.get(tenant.uuid);
+      if (cached && cached.expiresAt > Date.now()) {
+        res.set('Content-Type', 'application/canimus+json; charset=utf-8');
+        res.set('X-Cache', 'HIT');
+        return res.json(cached.json);
+      }
+
+      const sanoraUrl = getSanoraUrl();
+      const productsResp = await fetchWithRetry(`${sanoraUrl}/products/${tenant.uuid}`, { timeout: 15000 });
+      if (!productsResp.ok) return res.status(502).json({ error: 'Could not load products' });
+      const products = await productsResp.json();
+
+      const sanoraPublicUrl = getSanoraPublicUrl(req);
+      const pageUrl = `${reqProto(req)}://${req.get('host')}/plugin/agora/${tenant.uuid}`;
+
+      const children = [];
+      for (const [key, product] of Object.entries(products)) {
+        if (product.category !== 'music') continue;
+        const cover     = product.image ? `${sanoraPublicUrl}/images/${product.image}` : null;
+        const artifacts = product.artifacts || [];
+        const name      = product.title || key;
+
+        if (artifacts.length > 1) {
+          children.push({
+            type:        'album',
+            name,
+            artist:      tenant.name || name,
+            description: product.description || '',
+            images:      cover ? [{ src: cover }] : [],
+            children:    artifacts.map((a, i) => ({
+              type:   'track',
+              name:   `${name} — Track ${i + 1}`,
+              artist: tenant.name || name,
+              url:    `${sanoraPublicUrl}/artifacts/${a}`,
+              images: cover ? { cover: { src: cover } } : {}
+            }))
+          });
+        } else if (artifacts.length === 1) {
+          children.push({
+            type:   'track',
+            name,
+            artist: tenant.name || name,
+            description: product.description || '',
+            url:    `${sanoraPublicUrl}/artifacts/${artifacts[0]}`,
+            images: cover ? { cover: { src: cover } } : {}
+          });
+        }
+      }
+
+      const feed = {
+        type:        'feed',
+        name:        tenant.name || 'Agora',
+        url:         pageUrl,
+        description: tenant.description || '',
+        links: [
+          { rel: 'self',      type: 'application/canimus+json', href: `${pageUrl}/feed/canimus.json` },
+          { rel: 'alternate', type: 'application/rss+xml',      href: `${pageUrl}/feed/canimus` },
+          { rel: 'alternate', type: 'text/html',                href: pageUrl }
+        ],
+        children
+      };
+
+      canimusJsonCache.set(tenant.uuid, { json: feed, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+
+      res.set('Content-Type', 'application/canimus+json; charset=utf-8');
+      res.set('X-Cache', 'MISS');
+      res.json(feed);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -4504,8 +5012,9 @@ async function startServer(params) {
       const sigErr = checkOwnerSignature(req, tenant, 24 * 60 * 60 * 1000);
       const uploadAuth = sigErr ? null : { timestamp: req.query.timestamp, signature: req.query.signature };
 
+      const pageUrl = `${reqProto(req)}://${req.get('host')}/plugin/agora/${tenant.uuid}`;
       res.set('Content-Type', 'text/html');
-      res.send(generateAgoraHTML(tenant, goods, uploadAuth));
+      res.send(generateAgoraHTML(tenant, goods, uploadAuth, pageUrl));
     } catch (err) {
       console.error('[agora] page error:', err);
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
@@ -4518,6 +5027,8 @@ async function startServer(params) {
   console.log('   POST /plugin/agora/upload          — upload goods archive');
   console.log('   GET  /plugin/agora/:id             — agora page');
   console.log('   GET  /plugin/agora/:id/goods       — goods JSON');
+  console.log('   GET  /plugin/agora/:id/feed/canimus      — Canimus RSS 2.0 music feed');
+  console.log('   GET  /plugin/agora/:id/feed/canimus.json — Canimus JSON feed (dolores player)');
 }
 
 module.exports = { startServer };

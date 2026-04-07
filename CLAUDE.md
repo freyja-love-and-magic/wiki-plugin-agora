@@ -102,13 +102,19 @@ my-agora.zip
   "emojicode": "🛍️🎨🎁🌟💎🐉📚🔥",
   "name": "My Agora",
   "keywords": ["digital goods", "indie creator", "music", "books"],
-  "lightMode": false
+  "description": "Independent music, books, and more from a Planet Nine creator.",
+  "lightMode": false,
+  "email": "seller@example.com"
 }
 ```
 
 `keywords` is optional. Stored in the tenant record and rendered as a `<meta name="keywords">` tag.
 
 `redirects` is optional. Each key is a content category and the value is an external URL. Clicking any card in that category sends visitors to that URL instead of the plugin's built-in pages.
+
+`description` is optional. A one-sentence description of the agora, used in `og:description` and `<meta name="description">` for link previews and SEO. If omitted, a description is auto-generated from the available content sections (e.g. "Jane Doe — books, music, and more. Available now.").
+
+`email` is optional. The tenant's notification email address. When set, the server sends a notification email for every purchase, booking, or subscription. Stored in `tenants.json` and updated on every re-upload.
 
 `lightMode` is optional (default `false`). When `true`, the agora page uses light mode styling (white cards, `#f5f5f7` background, `#0066cc` accent). Default is dark mode (`#0f0f12` background, `#7ec8e3` accent). Stored in `tenants.json` and applied on every page load — no re-upload needed once set.
 
@@ -227,6 +233,8 @@ The hero image is resolved automatically: `hero.jpg` or `hero.png` is used if pr
 | `GET`  | `/plugin/agora/:id/goods` | Public | Goods JSON |
 | `GET`  | `/plugin/agora/:id/goods?category=books` | Public | Filtered goods JSON |
 | `GET`  | `/plugin/agora/:id/music/feed` | Public | Music feed `{ albums, tracks }` built from Sanora products |
+| `GET`  | `/plugin/agora/:id/feed/canimus` | Public | Canimus RSS 2.0 + iTunes feed for music distribution |
+| `GET`  | `/plugin/agora/:id/feed/canimus.json` | Public | Canimus JSON feed (`application/canimus+json`) for the dolores audio player |
 | `GET`  | `/plugin/agora/:id/book/:title` | Public | Appointment booking page (standalone) |
 | `GET`  | `/plugin/agora/:id/book/:title/slots` | Public | Available slots JSON |
 | `GET`  | `/plugin/agora/:id/subscribe/:title` | Public | Subscription sign-up page (standalone) |

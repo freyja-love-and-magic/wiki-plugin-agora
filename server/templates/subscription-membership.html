@@ -76,16 +76,16 @@
 <body>
   <header>
     <h1>🎁 Infuse Portal</h1>
-    <p>Enter your recovery key to access your infuser benefits</p>
+    <p>Enter your email to access your infuser benefits</p>
   </header>
 
   <div class="container">
 
     <div id="key-section">
       <h2>Check your infusions</h2>
-      <p>Enter the recovery key you used when you subscribed.</p>
+      <p>Enter the email you used when you subscribed.</p>
       <div class="input-row">
-        <input type="text" id="recovery-key" placeholder="Your recovery key…" autocomplete="off" onkeydown="if(event.key==='Enter')checkMembership()">
+        <input type="email" id="recovery-key" placeholder="you@example.com" autocomplete="email" value="{{sessionEmail}}" onkeydown="if(event.key==='Enter')checkMembership()">
         <button class="btn-primary" id="check-btn" onclick="checkMembership()">Check →</button>
       </div>
       <div id="check-error" class="error-msg"></div>
@@ -109,6 +109,11 @@
 
     const AGORA_URL = '{{agoraUrl}}';
 
+    // Auto-check if email was restored from session
+    if ('{{sessionEmail}}') {
+      window.addEventListener('DOMContentLoaded', () => checkMembership());
+    }
+
     function artifactIcon(name) {
       const ext = (name.split('.').pop() || '').toLowerCase();
       if (['mp3','flac','m4a','ogg','wav'].includes(ext)) return '🎵';
@@ -127,7 +132,7 @@
       const recoveryKey = document.getElementById('recovery-key').value.trim();
       const errorEl     = document.getElementById('check-error');
       const loadEl      = document.getElementById('check-loading');
-      if (!recoveryKey) { errorEl.textContent = 'Please enter your recovery key.'; errorEl.style.display = 'block'; return; }
+      if (!recoveryKey || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recoveryKey)) { errorEl.textContent = 'Please enter a valid email address.'; errorEl.style.display = 'block'; return; }
       errorEl.style.display = 'none';
       loadEl.style.display  = 'block';
       loadEl.textContent    = 'Checking…';

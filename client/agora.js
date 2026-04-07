@@ -144,6 +144,10 @@
                 <div class="sw-step-num">6</div>
                 <div class="sw-step-body"><strong>To update your agora</strong>, add content to your folder and run <code>node agora-sign.js</code> again — existing items are overwritten, new ones added.</div>
               </div>
+              <div class="sw-step">
+                <div class="sw-step-num">7</div>
+                <div class="sw-step-body"><strong>To view your orders</strong>, run <code>node agora-sign.js orders https://yourwiki.com</code>. This generates a signed link (valid for 5 minutes) and opens your order dashboard in the browser.</div>
+              </div>
             </div>
           </div>
 
