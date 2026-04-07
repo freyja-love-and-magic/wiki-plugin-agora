@@ -91,6 +91,8 @@ my-agora.zip
       cover.jpg           ← optional cover image
       info.json           ← required (see format below)
       bonus-track.mp3     ← any other files become exclusive member content
+  bio/
+    photo.jpg             ← optional creator portrait (up to 1024×1024 px)
       chapter-draft.pdf
 ```
 
@@ -114,9 +116,13 @@ my-agora.zip
 
 `description` is optional. A one-sentence description of the agora, used in `og:description` and `<meta name="description">` for link previews and SEO. If omitted, a description is auto-generated from the available content sections (e.g. "Jane Doe — books, music, and more. Available now.").
 
+`mirloUrl` is optional. A Mirlo artist page URL (e.g. `https://mirlo.space/bury-the-needle`). On every upload, the agora fetches the artist's published albums and tracks from the Mirlo public API and merges them into the Canimus feeds (`/feed/canimus` and `/feed/canimus.json`) alongside locally-uploaded music. The result is cached in `tenants.json` as `mirloFeed` and refreshed on each re-upload.
+
 `email` is optional. The tenant's notification email address. When set, the server sends a notification email for every purchase, booking, or subscription. Stored in `tenants.json` and updated on every re-upload.
 
 `lightMode` is optional (default `false`). When `true`, the agora page uses light mode styling (white cards, `#f5f5f7` background, `#0066cc` accent). Default is dark mode (`#0f0f12` background, `#7ec8e3` accent). Stored in `tenants.json` and applied on every page load — no re-upload needed once set.
+
+`bio` is optional. A creator profile displayed above the section cards on the home tab. Fields: `name` (string), `title` (string — role/tagline), `description` (string, max 2048 characters). The image is read from a `bio/` subfolder in the archive (first image found, up to 1024×1024 px). Both `agora-sign.js` and the server validate the description length and image dimensions. Stored in `tenants.json` as `{ name, title, description, imageExt }`. Image served at `/plugin/agora/:id/bio/image`.
 
 ### books/*/info.json
 
@@ -197,11 +203,28 @@ The hero image is resolved automatically: `hero.jpg` or `hero.png` is used if pr
   "availability": [
     { "day": "Monday", "slots": ["09:00", "10:00", "11:00", "14:00", "15:00"] },
     { "day": "Wednesday", "slots": ["09:00", "10:00", "14:00"] }
-  ]
+  ],
+  "bookingForm": [
+    { "id": "event_type",  "label": "Type of event",   "type": "text",     "required": true },
+    { "id": "event_date",  "label": "Event date",       "type": "date",     "required": true },
+    { "id": "location",    "label": "Location / venue", "type": "text" },
+    { "id": "guests",      "label": "Expected guests",  "type": "number" },
+    { "id": "details",     "label": "Anything else?",   "type": "textarea" }
+  ],
+  "bookingEmail": "bookings@example.com"
 }
 ```
 
 `price` is in cents. `duration` is minutes per slot. `timezone` is any IANA timezone string. `advanceDays` limits how far ahead slots are shown. `availability` lists days of the week with start times for each slot.
+
+`availability` and `bookingForm` are both optional and independent:
+- **`availability` only** — office-hours scheduler (current behavior)
+- **`bookingForm` only** — inquiry/quote form with no fixed price or slots (e.g. face painting, custom work)
+- **Both** — scheduler shown first, inquiry form shown below with an "Or send an inquiry" divider
+
+`bookingForm` is an array of field descriptors `{ id, label, type, required, placeholder, options }`. Supported types: `text`, `textarea`, `number`, `date`, `email`, `tel`, `select` (with `options: [...]`). The form always appends Name and Email fields automatically.
+
+`bookingEmail` (optional) — override address for inquiry emails. Falls back to `manifest.json` `email` if omitted.
 
 ### subscriptions/*/info.json
 
@@ -235,6 +258,7 @@ The hero image is resolved automatically: `hero.jpg` or `hero.png` is used if pr
 | `GET`  | `/plugin/agora/:id/music/feed` | Public | Music feed `{ albums, tracks }` built from Sanora products |
 | `GET`  | `/plugin/agora/:id/feed/canimus` | Public | Canimus RSS 2.0 + iTunes feed for music distribution |
 | `GET`  | `/plugin/agora/:id/feed/canimus.json` | Public | Canimus JSON feed (`application/canimus+json`) for the dolores audio player |
+| `GET`  | `/plugin/agora/:id/bio/image` | Public | Creator bio portrait image |
 | `GET`  | `/plugin/agora/:id/book/:title` | Public | Appointment booking page (standalone) |
 | `GET`  | `/plugin/agora/:id/book/:title/slots` | Public | Available slots JSON |
 | `GET`  | `/plugin/agora/:id/subscribe/:title` | Public | Subscription sign-up page (standalone) |

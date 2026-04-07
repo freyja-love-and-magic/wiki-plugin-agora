@@ -48,6 +48,29 @@ function readManifest() {
   }
 }
 
+function getImageDimensions(buf) {
+  // PNG
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+  }
+  // JPEG
+  if (buf[0] === 0xFF && buf[1] === 0xD8) {
+    let offset = 2;
+    while (offset + 4 < buf.length) {
+      if (buf[offset] !== 0xFF) break;
+      const marker = buf[offset + 1];
+      if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7) ||
+          (marker >= 0xC9 && marker <= 0xCB) || (marker >= 0xCD && marker <= 0xCF)) {
+        return { height: buf.readUInt16BE(offset + 5), width: buf.readUInt16BE(offset + 7) };
+      }
+      const segLen = buf.readUInt16BE(offset + 2);
+      if (segLen < 2) break;
+      offset += 2 + segLen;
+    }
+  }
+  return null;
+}
+
 function keyFilePath(uuid) {
   return path.join(KEYS_DIR, `${uuid}.json`);
 }
@@ -140,6 +163,31 @@ async function sign() {
     console.error('⚠️   agora-key.json is still in this folder.');
     console.error('   Run  node agora-sign.js init  to store it securely first.');
     process.exit(1);
+  }
+
+  // ── Validate bio (if present) ────────────────────────────────────────────
+  if (manifest.bio && typeof manifest.bio === 'object') {
+    const bioDesc = manifest.bio.description ? String(manifest.bio.description).trim() : '';
+    if (bioDesc.length > 2048) {
+      console.error(`❌  bio.description is too long: ${bioDesc.length} characters (max 2048).`);
+      process.exit(1);
+    }
+
+    // Check bio image if a bio/ folder exists
+    const bioDir = path.join(AGORA_DIR, 'bio');
+    if (fs.existsSync(bioDir)) {
+      const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+      const bioImages = fs.readdirSync(bioDir).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
+      if (bioImages.length > 0) {
+        const imgBuf = fs.readFileSync(path.join(bioDir, bioImages[0]));
+        const dims   = getImageDimensions(imgBuf);
+        if (dims && (dims.width > 1024 || dims.height > 1024)) {
+          console.error(`❌  bio image must be at most 1024×1024 px (got ${dims.width}×${dims.height}).`);
+          console.error('   Please resize it before signing.');
+          process.exit(1);
+        }
+      }
+    }
   }
 
   const keyData = loadStoredKey(manifest.uuid);

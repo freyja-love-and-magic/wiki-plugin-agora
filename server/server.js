@@ -56,6 +56,7 @@ const CONFIG_FILE  = path.join(DATA_DIR, 'config.json');
 // This file contains PII (name, address). Purge individual records once orders ship.
 const ORDERS_FILE     = path.join(DATA_DIR, 'orders.json');
 const AFFILIATES_FILE = path.join(DATA_DIR, 'affiliates.json');
+const BIOS_DIR        = path.join(DATA_DIR, 'bios');
 const TMP_DIR      = '/tmp/agora-uploads';
 
 // One-time migration: copy ~/.shoppe/ → ~/.agora/ if the old directory exists and new one doesn't.
@@ -822,6 +823,102 @@ async function sanoraEnsureUser(tenant) {
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const normalizeTitle = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+// Returns { width, height } from a raw image buffer (PNG or JPEG), or null if unrecognised.
+function getImageDimensions(buf) {
+  // PNG: 8-byte signature then IHDR chunk (4 len + 4 "IHDR" + 4 width + 4 height)
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+  }
+  // JPEG: FF D8 then scan SOFn markers
+  if (buf[0] === 0xFF && buf[1] === 0xD8) {
+    let offset = 2;
+    while (offset + 4 < buf.length) {
+      if (buf[offset] !== 0xFF) break;
+      const marker = buf[offset + 1];
+      // SOF0–SOF3, SOF5–SOF7, SOF9–SOF11, SOF13–SOF15
+      if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7) ||
+          (marker >= 0xC9 && marker <= 0xCB) || (marker >= 0xCD && marker <= 0xCF)) {
+        return { height: buf.readUInt16BE(offset + 5), width: buf.readUInt16BE(offset + 7) };
+      }
+      const segLen = buf.readUInt16BE(offset + 2);
+      if (segLen < 2) break;
+      offset += 2 + segLen;
+    }
+  }
+  return null;
+}
+
+// ── Mirlo feed fetcher ────────────────────────────────────────────────────────
+// Given a Mirlo artist page URL (e.g. https://mirlo.space/bury-the-needle),
+// fetches the artist's published albums and tracks via the Mirlo public API
+// and returns a Canimus-JSON-compatible children array.
+async function fetchMirloFeed(mirloUrl) {
+  const parsed = new URL(mirloUrl);
+  // Derive API base: https://mirlo.space → https://api.mirlo.space
+  const apiBase = `${parsed.protocol}//api.${parsed.hostname}`;
+  // Last non-empty path segment is the artist slug
+  const slug = parsed.pathname.replace(/\/$/, '').split('/').filter(Boolean).pop();
+  if (!slug) throw new Error(`Could not parse artist slug from Mirlo URL: ${mirloUrl}`);
+
+  // 1. Resolve artist ID from slug
+  const artistResp = await fetchWithRetry(`${apiBase}/v1/artists/${slug}`, { timeout: 15000 });
+  if (!artistResp.ok) throw new Error(`Mirlo artist not found: ${slug} (${artistResp.status})`);
+  const artistData = await artistResp.json();
+  const artist = artistData.result;
+  const artistId = artist.id;
+  const artistName = artist.name || slug;
+
+  // 2. Fetch all published track groups for this artist
+  const tgResp = await fetchWithRetry(
+    `${apiBase}/v1/trackGroups?artistId=${artistId}&take=100&orderBy=releaseDate`,
+    { timeout: 15000 }
+  );
+  if (!tgResp.ok) throw new Error(`Mirlo track groups fetch failed (${tgResp.status})`);
+  const tgData = await tgResp.json();
+  const trackGroups = tgData.results || [];
+
+  const children = [];
+
+  for (const tg of trackGroups) {
+    // 3. Fetch full track group details (includes tracks with audio)
+    let fullTg;
+    try {
+      const fullResp = await fetchWithRetry(`${apiBase}/v1/trackGroups/${tg.id}`, { timeout: 15000 });
+      if (!fullResp.ok) continue;
+      const fullData = await fullResp.json();
+      fullTg = fullData.result;
+    } catch (e) {
+      console.warn(`[agora/mirlo] Failed to fetch trackGroup ${tg.id}: ${e.message}`);
+      continue;
+    }
+
+    const coverUrl = fullTg.cover?.sizes?.['300'] || fullTg.cover?.sizes?.original || null;
+    const tracks = (fullTg.tracks || []).filter(t => t.audio?.url);
+
+    if (tracks.length === 0) continue;
+
+    const albumChildren = tracks.map((track, i) => ({
+      type:   'track',
+      name:   track.title || `Track ${i + 1}`,
+      artist: artistName,
+      url:    `${apiBase}${track.audio.url}`,
+      ...(coverUrl ? { images: { cover: { src: coverUrl } } } : {})
+    }));
+
+    children.push({
+      type:        'album',
+      name:        fullTg.title || tg.title,
+      artist:      artistName,
+      description: fullTg.about || '',
+      images:      coverUrl ? [{ src: coverUrl }] : [],
+      children:    albumChildren
+    });
+  }
+
+  return { artistName, children };
+}
 
 // fetch() wrapper that retries on 429 with exponential backoff (1s, 2s, 4s).
 async function fetchWithRetry(url, options, maxRetries = 3) {
@@ -1173,6 +1270,58 @@ async function processArchive(zipPath, onProgress = () => {}) {
     if (manifest.description && typeof manifest.description === 'string') {
       tenantUpdates.description = manifest.description.trim();
     }
+    if (manifest.mirloUrl && typeof manifest.mirloUrl === 'string') {
+      try {
+        onProgress({ type: 'progress', current: 0, total: 1, label: '🎵 Fetching Mirlo feed…' });
+        const mirloResult = await fetchMirloFeed(manifest.mirloUrl.trim());
+        tenantUpdates.mirloFeed = {
+          url:        manifest.mirloUrl.trim(),
+          artistName: mirloResult.artistName,
+          children:   mirloResult.children,
+          fetchedAt:  Date.now()
+        };
+        console.log(`[agora] Mirlo feed fetched: ${mirloResult.children.length} albums from ${manifest.mirloUrl}`);
+      } catch (e) {
+        console.warn(`[agora] Mirlo feed fetch failed: ${e.message}`);
+        onProgress({ type: 'warning', message: `Mirlo feed fetch failed: ${e.message}` });
+      }
+    }
+    // ── bio ──────────────────────────────────────────────────────────────────
+    if (manifest.bio && typeof manifest.bio === 'object') {
+      const bio = manifest.bio;
+
+      // Validate description length
+      const bioDesc = bio.description ? String(bio.description).trim() : '';
+      if (bioDesc.length > 2048) {
+        throw new Error(`bio.description exceeds 2048 characters (got ${bioDesc.length})`);
+      }
+
+      // Find bio image in the archive's bio/ folder
+      const bioDir = path.join(root, 'bio');
+      let bioImageExt = null;
+      if (fs.existsSync(bioDir)) {
+        const bioImages = fs.readdirSync(bioDir).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
+        if (bioImages.length > 0) {
+          const imgFile = bioImages[0];
+          const imgBuf  = fs.readFileSync(path.join(bioDir, imgFile));
+          const dims    = getImageDimensions(imgBuf);
+          if (dims && (dims.width > 1024 || dims.height > 1024)) {
+            throw new Error(`bio image must be at most 1024×1024 px (got ${dims.width}×${dims.height})`);
+          }
+          bioImageExt = path.extname(imgFile).toLowerCase();
+          fs.mkdirSync(BIOS_DIR, { recursive: true });
+          fs.writeFileSync(path.join(BIOS_DIR, `${tenant.uuid}${bioImageExt}`), imgBuf);
+        }
+      }
+
+      tenantUpdates.bio = {
+        name:        bio.name        ? String(bio.name).trim()  : '',
+        title:       bio.title       ? String(bio.title).trim() : '',
+        description: bioDesc,
+        imageExt:    bioImageExt,
+      };
+    }
+
     if (Object.keys(tenantUpdates).length > 0) {
       const tenants = loadTenants();
       Object.assign(tenants[tenant.uuid], tenantUpdates);
@@ -1251,10 +1400,10 @@ async function processArchive(zipPath, onProgress = () => {}) {
         const stat = fs.statSync(entryPath);
 
         if (stat.isDirectory()) {
-          // Album — supports info.json: { title, description, price, cover }
+          // Album — supports info.json: { title, description, price, cover, tracks: ["Name 1", ...] }
           const info = readInfo(entryPath);
           const albumTitle = info.title || entry;
-          const tracks = fs.readdirSync(entryPath).filter(f => MUSIC_EXTS.has(path.extname(f).toLowerCase()));
+          const tracks = fs.readdirSync(entryPath).filter(f => MUSIC_EXTS.has(path.extname(f).toLowerCase())).sort();
           const covers = fs.readdirSync(entryPath).filter(f => IMAGE_EXTS.has(path.extname(f).toLowerCase()));
           try {
             const description = info.description || `Album: ${albumTitle}`;
@@ -1266,6 +1415,13 @@ async function processArchive(zipPath, onProgress = () => {}) {
               const coverBuf = fs.readFileSync(path.join(entryPath, coverFile));
               await sanoraUploadImage(tenant, albumTitle, coverBuf, coverFile);
             }
+            // Build track names: info.json tracks[] wins, otherwise clean up filename
+            const trackNames = tracks.map((f, i) => {
+              if (Array.isArray(info.tracks) && info.tracks[i]) return String(info.tracks[i]);
+              return path.basename(f, path.extname(f)).replace(/^\d+[-_.\s]+/, '').trim() || `Track ${i + 1}`;
+            });
+            const tracklistBuf = Buffer.from(JSON.stringify({ tracks: trackNames }));
+            await sanoraUploadArtifact(tenant, albumTitle, tracklistBuf, 'tracklist.json', 'application/json');
             for (const track of tracks) {
               const buf = fs.readFileSync(path.join(entryPath, track));
               await sanoraUploadArtifact(tenant, albumTitle, buf, track, 'audio');
@@ -1657,7 +1813,10 @@ async function processArchive(zipPath, onProgress = () => {}) {
             duration:     info.duration     || 60,
             timezone:     info.timezone     || 'America/New_York',
             availability: info.availability || [],
-            advanceDays:  info.advanceDays  || 30
+            advanceDays:  info.advanceDays  || 30,
+            ...(Array.isArray(info.bookingForm) && info.bookingForm.length > 0
+              ? { bookingForm: info.bookingForm } : {}),
+            ...(info.bookingEmail ? { bookingEmail: String(info.bookingEmail).trim() } : {}),
           };
 
           onProgress({ type: 'progress', current: ++current, total, label: `📅 ${title}` });
@@ -1752,11 +1911,14 @@ async function getAgoraGoods(tenant, imageBaseUrl) {
       description: product.description || '',
       price: product.price || 0,
       shipping: product.shipping || 0,
-      image: product.image ? `${imageBaseUrl || getSanoraUrl()}/images/${product.image}` : null,
+      image: product.image ? `${imageBaseUrl}/images/${product.image}` : null,
       url: resolvedUrl,
       ...(isPost && { category: product.category, tags: product.tags || '' }),
       ...(lucillePlayerUrl && { lucillePlayerUrl }),
-      ...(product.category === 'video' && { agoraId: tenant.uuid })
+      ...(product.category === 'video' && { agoraId: tenant.uuid }),
+      ...(product.category === 'album' && {
+        photos: (product.artifacts || []).map(a => `${imageBaseUrl}/artifacts/${a}`)
+      }),
     };
     const bucket = goods[bucketName];
     if (bucket) bucket.push(item);
@@ -1779,10 +1941,13 @@ async function getAgoraGoods(tenant, imageBaseUrl) {
     ...goods.appointments.map(async item => {
       const product = productsByTitle[item.title];
       if (!product) return;
-      item.productId = product.productId || '';
-      const schedule  = await getAppointmentSchedule(tenant, product).catch(() => null);
-      item.timezone   = schedule ? (schedule.timezone || 'UTC') : 'UTC';
-      item.duration   = schedule ? (schedule.duration  || 60)  : 60;
+      item.productId   = product.productId || '';
+      const schedule   = await getAppointmentSchedule(tenant, product).catch(() => null);
+      item.timezone    = schedule ? (schedule.timezone || 'UTC') : 'UTC';
+      item.duration    = schedule ? (schedule.duration  || 60)  : 60;
+      item.hasSchedule   = !!(schedule && Array.isArray(schedule.availability) && schedule.availability.length > 0);
+      item.bookingForm   = schedule?.bookingForm || null;
+      item.contactEmail  = schedule?.bookingEmail || tenant.email || '';
     })
   ]);
 
@@ -2188,6 +2353,26 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
     : allSectionIds
   ).filter(id => goodsMap[id]?.length > 0);
 
+  const total = orderedSections.reduce((sum, id) => sum + (goodsMap[id]?.length || 0), 0);
+
+  // Bio banner (optional) — shown above the home-grid
+  const bioBanner = (() => {
+    const bio = tenant.bio;
+    if (!bio || (!bio.name && !bio.title && !bio.description && !bio.imageExt)) return '';
+    const bioImgUrl = `${pageUrl}/bio/image`;
+    const photoHtml = bio.imageExt
+      ? `<img class="bio-photo" src="${escHtml(bioImgUrl)}" alt="${escHtml(bio.name || 'bio photo')}">`
+      : `<div class="bio-photo-placeholder">👤</div>`;
+    return `<div class="bio-banner">
+      ${photoHtml}
+      <div class="bio-body">
+        ${bio.name  ? `<div class="bio-name">${escHtml(bio.name)}</div>` : ''}
+        ${bio.title ? `<div class="bio-title">${escHtml(bio.title)}</div>` : ''}
+        ${bio.description ? `<div class="bio-desc">${escHtml(bio.description)}</div>` : ''}
+      </div>
+    </div>`;
+  })();
+
   // Home landing cards — one tile per section
   const homeCards = orderedSections.map(id => {
     const meta   = SECTION_META[id];
@@ -2206,10 +2391,15 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
   }).join('');
 
   // Nav tabs: Home + one per ordered section
+  const redirects = tenant.redirects || {};
   const tabs = [
     `<div class="tab active" data-id="home" onclick="show('home',this)">🏠 Home</div>`,
     ...orderedSections.map(id => {
       const meta = SECTION_META[id];
+      const redir = redirects[id];
+      if (redir) {
+        return `<a class="tab tab-external" href="${escHtml(redir)}" target="_blank" rel="noopener" data-id="${id}">${meta.label} <span class="badge">${goodsMap[id].length}</span> <span class="tab-ext-icon">↗</span></a>`;
+      }
       return `<div class="tab" data-id="${id}" onclick="show('${id}',this)">${meta.label} <span class="badge">${goodsMap[id].length}</span></div>`;
     })
   ].join('');
@@ -2343,8 +2533,11 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
     .tab { padding: 14px 18px; cursor: pointer; font-size: 14px; font-weight: 500; white-space: nowrap; border-bottom: 2px solid transparent; color: var(--text-2); transition: color 0.15s, border-color 0.15s; }
     .tab:hover { color: var(--accent); }
     .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    a.tab-external { text-decoration: none; }
+    .tab-ext-icon { font-size: 11px; opacity: 0.7; margin-left: 2px; }
     .badge { background: var(--badge-bg); color: var(--accent); border-radius: 10px; padding: 1px 7px; font-size: 11px; margin-left: 5px; }
     main { max-width: 1200px; margin: 0 auto; padding: 36px 24px; }
+    #music { padding-bottom: 80px; }
     .section { display: none; }
     .section.active { display: block; }
     .home-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 20px; }
@@ -2355,7 +2548,41 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
     .home-card-body { padding: 14px 16px; }
     .home-card-title { font-size: 15px; font-weight: 700; margin-bottom: 3px; }
     .home-card-count { font-size: 13px; color: var(--text-3); }
+    .bio-banner { display: flex; gap: 28px; align-items: flex-start; background: var(--card-bg); border-radius: 18px; padding: 28px 32px; margin-bottom: 32px; box-shadow: 0 2px 10px var(--shadow); }
+    .bio-photo { width: 120px; height: 120px; border-radius: 50%; object-fit: cover; flex-shrink: 0; background: var(--placeholder); }
+    .bio-photo-placeholder { width: 120px; height: 120px; border-radius: 50%; flex-shrink: 0; background: var(--placeholder); display: flex; align-items: center; justify-content: center; font-size: 52px; }
+    .bio-body { flex: 1; min-width: 0; }
+    .bio-name { font-size: 22px; font-weight: 700; margin-bottom: 3px; }
+    .bio-title { font-size: 14px; color: var(--accent); font-weight: 500; margin-bottom: 12px; }
+    .bio-desc { font-size: 14px; color: var(--text-2); line-height: 1.65; white-space: pre-wrap; }
+    @media (max-width: 520px) { .bio-banner { flex-direction: column; align-items: center; text-align: center; padding: 20px 18px; } }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 20px; }
+    /* ── Album gallery ── */
+    .album-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
+    .album-cover-card { background: var(--card-bg); border-radius: 14px; overflow: hidden; cursor: pointer; box-shadow: 0 2px 8px var(--shadow); transition: transform 0.18s, box-shadow 0.18s; }
+    .album-cover-card:hover { transform: translateY(-3px); box-shadow: 0 8px 24px var(--shadow-hover); }
+    .album-cover-img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; background: var(--placeholder); }
+    .album-cover-no-img { width: 100%; aspect-ratio: 1; background: var(--placeholder); display: flex; align-items: center; justify-content: center; font-size: 52px; }
+    .album-cover-body { padding: 12px 14px; }
+    .album-cover-title { font-size: 15px; font-weight: 700; }
+    .album-cover-count { font-size: 12px; color: var(--text-3); margin-top: 2px; }
+    .album-detail-back { background: none; border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; font-size: 13px; cursor: pointer; color: var(--text-2); margin-bottom: 20px; }
+    .album-detail-back:hover { border-color: var(--accent); color: var(--accent); }
+    .album-detail-title { font-size: 22px; font-weight: 700; margin-bottom: 16px; }
+    .album-photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 6px; }
+    .album-photo-thumb { aspect-ratio: 1; object-fit: cover; width: 100%; cursor: pointer; border-radius: 4px; transition: opacity 0.15s; background: var(--placeholder); }
+    .album-photo-thumb:hover { opacity: 0.85; }
+    /* ── Lightbox ── */
+    .lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.92); z-index: 1000; align-items: center; justify-content: center; }
+    .lightbox.open { display: flex; }
+    .lightbox-img { max-width: 92vw; max-height: 88vh; border-radius: 4px; object-fit: contain; }
+    .lightbox-close { position: absolute; top: 18px; right: 22px; font-size: 28px; color: #fff; cursor: pointer; line-height: 1; opacity: 0.8; }
+    .lightbox-close:hover { opacity: 1; }
+    .lightbox-prev, .lightbox-next { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,0.12); border: none; color: #fff; font-size: 28px; padding: 12px 16px; cursor: pointer; border-radius: 8px; }
+    .lightbox-prev { left: 12px; }
+    .lightbox-next { right: 12px; }
+    .lightbox-prev:hover, .lightbox-next:hover { background: rgba(255,255,255,0.22); }
+    .lightbox-counter { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); color: rgba(255,255,255,0.6); font-size: 13px; }
     .card { background: var(--card-bg); border-radius: 14px; overflow: hidden; box-shadow: 0 2px 8px var(--shadow); cursor: pointer; transition: transform 0.18s, box-shadow 0.18s; }
     .card:hover { transform: translateY(-3px); box-shadow: 0 8px 24px var(--shadow-hover); }
     .card-img img { width: 100%; height: 190px; object-fit: cover; display: block; }
@@ -2401,6 +2628,10 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
     .posts-part-arrow { color: var(--accent); font-size: 14px; }
     .posts-standalones-label { font-size: 12px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: .5px; margin: 28px 0 12px; }
     /* ── Music player ── */
+    .mirlo-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; margin-bottom: 20px; }
+    .mirlo-banner-text { font-size: 13px; color: var(--text-2); }
+    .mirlo-banner-btn { font-size: 13px; font-weight: 600; color: var(--accent); text-decoration: none; border: 1px solid var(--accent); border-radius: 20px; padding: 5px 14px; white-space: nowrap; }
+    .mirlo-banner-btn:hover { background: var(--accent); color: var(--bg); }
     .music-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 20px; }
     .music-album-card { cursor: pointer; }
     .music-back-btn { background: none; border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; font-size: 13px; cursor: pointer; margin-bottom: 20px; color: var(--text); }
@@ -2501,6 +2732,15 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
     .appt-confirm-box .icon { font-size: 48px; margin-bottom: 10px; }
     .appt-confirm-box h3 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
     .appt-confirm-box .slot-label { color: var(--accent); font-size: 15px; font-weight: 600; margin-bottom: 8px; }
+    .appt-section-divider { display: flex; align-items: center; gap: 12px; margin: 20px 0 16px; color: var(--text-3); font-size: 12px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }
+    .appt-section-divider::before, .appt-section-divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+    .appt-inquiry-form { margin-top: 4px; }
+    .appt-inquiry-field { margin-bottom: 12px; }
+    .appt-inquiry-field label { display: block; font-size: 12px; font-weight: 600; color: var(--text-2); margin-bottom: 4px; }
+    .appt-inquiry-field input, .appt-inquiry-field textarea, .appt-inquiry-field select { width: 100%; background: var(--input-bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; font-size: 14px; color: var(--text); font-family: inherit; transition: border-color 0.15s; }
+    .appt-inquiry-field input:focus, .appt-inquiry-field textarea:focus, .appt-inquiry-field select:focus { outline: none; border-color: var(--accent); }
+    .appt-inquiry-field textarea { resize: vertical; min-height: 80px; }
+    .appt-inquiry-sent { background: var(--ok-bg); border: 1px solid var(--ok-border); color: var(--ok-text); border-radius: 10px; padding: 16px 20px; font-size: 14px; text-align: center; margin-top: 8px; }
   </style>
 </head>
 <body${tenant.lightMode ? ' class="light"' : ''}>
@@ -2511,9 +2751,10 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
   </header>
   <nav>${tabs}</nav>
   <main>
-    <div id="home" class="section active"><div class="home-grid">${homeCards}</div></div>
+    <div id="home" class="section active">${bioBanner}<div class="home-grid">${homeCards}</div></div>
     <div id="books" class="section"><div class="grid">${renderCards(goods.books, 'book')}</div></div>
     <div id="music" class="section">
+      ${tenant.mirloFeed?.url ? `<div class="mirlo-banner"><span class="mirlo-banner-text">Support this music on Mirlo</span><a href="${escHtml(tenant.mirloFeed.url)}" target="_blank" rel="noopener" class="mirlo-banner-btn">Visit Mirlo →</a></div>` : ''}
       <div id="music-album-grid"></div>
       <div id="music-album-detail" style="display:none">
         <button class="music-back-btn" onclick="musicShowGrid()">&#8592; Albums</button>
@@ -2529,7 +2770,21 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
         <div id="posts-parts-list"></div>
       </div>
     </div>
-    <div id="albums" class="section"><div class="grid">${renderCards(goods.albums, 'album')}</div></div>
+    <div id="albums" class="section">
+      <div id="album-grid-view"><div class="album-grid" id="album-covers"></div></div>
+      <div id="album-detail-view" style="display:none">
+        <button class="album-detail-back" onclick="albumShowGrid()">← Albums</button>
+        <div class="album-detail-title" id="album-detail-title"></div>
+        <div class="album-photo-grid" id="album-photo-grid"></div>
+      </div>
+    </div>
+    <div class="lightbox" id="lightbox" onclick="lbClose(event)">
+      <span class="lightbox-close" onclick="document.getElementById('lightbox').classList.remove('open');document.removeEventListener('keydown',lbKey)">✕</span>
+      <button class="lightbox-prev" onclick="lbNav(-1);event.stopPropagation()">‹</button>
+      <img class="lightbox-img" id="lightbox-img" src="" alt="">
+      <button class="lightbox-next" onclick="lbNav(1);event.stopPropagation()">›</button>
+      <div class="lightbox-counter" id="lightbox-counter"></div>
+    </div>
     <div id="products" class="section"><div class="grid">${renderCards(goods.products, 'product')}</div></div>
     <div id="videos" class="section"><div class="grid">${renderCards(goods.videos, 'video')}</div></div>
     <div id="appointments" class="section">
@@ -2572,16 +2827,31 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
   </div>
   <script>
     const UPLOAD_AUTH = ${uploadAuth ? JSON.stringify(uploadAuth) : 'null'};
-    function show(id, tab) {
+    function show(id, tab, noHistory) {
       document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.getElementById(id).classList.add('active');
-      tab.classList.add('active');
+      (tab || document.querySelector('.tab[data-id="' + id + '"]')).classList.add('active');
       if (id === 'music' && !_musicLoaded) initMusic();
       if (id === 'posts' && !_postsLoaded) initPosts();
+      if (id === 'albums' && !_albumsLoaded) initAlbums();
       if (id === 'subscriptions' && !_subsLoaded) initSubscriptions();
       if (id === 'appointments' && !_apptsLoaded) initAppointments();
+      if (!noHistory) {
+        if (id !== 'home') history.replaceState(null, '', '#' + id);
+        else history.replaceState(null, '', window.location.pathname + window.location.search);
+      }
     }
+    // On load and on back/forward, activate the tab matching the URL hash
+    // Deep hash handled by each section after its data loads (e.g. _musicHandleDeepHash)
+    function _activateHashTab() {
+      const parts = window.location.hash.slice(1).split('/');
+      const topId = parts[0];
+      const target = topId && document.getElementById(topId) && document.querySelector('.tab[data-id="' + topId + '"]') ? topId : 'home';
+      show(target, null, /*noHistory=*/true);
+    }
+    document.addEventListener('DOMContentLoaded', _activateHashTab);
+    window.addEventListener('popstate', _activateHashTab);
 
     // ── Posts browser ───────────────────────────────────────────────────────
     const _postsRaw = ${(() => {
@@ -2698,8 +2968,33 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
           ..._musicTracks.map(t => ({ ...t, albumName: '' }))
         ];
         musicRenderGrid();
+        _musicHandleDeepHash();
       } catch (e) {
         grid.innerHTML = '<p class="empty">Could not load music.</p>';
+      }
+    }
+
+    function _musicHandleDeepHash() {
+      const parts = window.location.hash.slice(1).split('/');
+      if (parts[0] !== 'music' || parts.length < 2) return;
+      const name = decodeURIComponent(parts[1]);
+      if (name.startsWith('~')) {
+        // Standalone track
+        const title = name.slice(1);
+        const idx = _musicTracks.findIndex(t => t.title === title);
+        if (idx >= 0) musicPlayStandalone(idx, true);
+        return;
+      }
+      // Album (and optional track number)
+      const albumIdx = _musicAlbums.findIndex(a => a.name === name);
+      if (albumIdx >= 0) {
+        musicShowAlbum(albumIdx, true);
+        if (parts[2]) {
+          const trackIdx = parseInt(parts[2], 10) - 1;
+          if (trackIdx >= 0 && trackIdx < _musicAlbums[albumIdx].tracks.length) {
+            musicPlayAlbumTrack(albumIdx, trackIdx, true);
+          }
+        }
       }
     }
 
@@ -2710,26 +3005,31 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
         return;
       }
       const albumsHtml = _musicAlbums.length ? \`<div class="music-grid">\${_musicAlbums.map((a, i) => \`
-        <div class="card music-album-card" onclick="musicShowAlbum(\${i})">
-          \${a.cover ? \`<div class="card-img"><img src="\${_escHtml(a.cover)}" alt="" loading="lazy"></div>\` : '<div class="card-img-placeholder">🎵</div>'}
+        <div class="card music-album-card">
+          <div onclick="musicShowAlbum(\${i})" style="cursor:pointer">
+            \${a.cover ? \`<div class="card-img"><img src="\${_escHtml(a.cover)}" alt="" loading="lazy"></div>\` : '<div class="card-img-placeholder">🎵</div>'}
+          </div>
           <div class="card-body">
-            <div class="card-title">\${_escHtml(a.name)}</div>
+            <div class="card-title" onclick="musicShowAlbum(\${i})" style="cursor:pointer">\${_escHtml(a.name)}</div>
             <div class="card-desc">\${a.tracks.length} track\${a.tracks.length !== 1 ? 's' : ''}</div>
           </div>
         </div>\`).join('')}</div>\` : '';
       const tracksHtml = _musicTracks.length ? \`
         <div class="music-singles-label">Singles</div>
         \${_musicTracks.map((t, i) => \`
-          <div class="music-track-row" id="mts-\${i}" onclick="musicPlayStandalone(\${i})">
-            \${t.cover ? \`<img class="music-track-cover" src="\${_escHtml(t.cover)}" alt="">\` : '<div class="music-track-cover-ph">🎵</div>'}
-            <div class="music-track-info"><div class="music-track-title">\${_escHtml(t.title)}</div></div>
-            <div class="music-play-icon">&#9654;</div>
+          <div class="music-track-row" id="mts-\${i}">
+            \${t.cover ? \`<img class="music-track-cover" src="\${_escHtml(t.cover)}" alt="" onclick="musicPlayStandalone(\${i})" style="cursor:pointer">\` : '<div class="music-track-cover-ph" onclick="musicPlayStandalone(' + i + ')" style="cursor:pointer">🎵</div>'}
+            <div class="music-track-info" onclick="musicPlayStandalone(\${i})" style="cursor:pointer">
+              <div class="music-track-title">\${_escHtml(t.title)}</div>
+            </div>
+            <div class="music-play-icon" onclick="musicPlayStandalone(\${i})">&#9654;</div>
           </div>\`).join('')}\` : '';
       grid.innerHTML = albumsHtml + tracksHtml;
     }
 
-    function musicShowAlbum(idx) {
+    function musicShowAlbum(idx, noHistory) {
       const a = _musicAlbums[idx];
+      if (!noHistory) history.replaceState(null, '', '#music/' + encodeURIComponent(a.name));
       document.getElementById('music-album-grid').style.display = 'none';
       const det = document.getElementById('music-album-detail');
       det.style.display = 'block';
@@ -2750,12 +3050,14 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
     }
 
     function musicShowGrid() {
+      history.replaceState(null, '', '#music');
       document.getElementById('music-album-grid').style.display = '';
       document.getElementById('music-album-detail').style.display = 'none';
     }
 
-    function musicPlayAlbumTrack(albumIdx, trackIdx) {
+    function musicPlayAlbumTrack(albumIdx, trackIdx, noHistory) {
       const a = _musicAlbums[albumIdx], t = a.tracks[trackIdx];
+      if (!noHistory) history.replaceState(null, '', '#music/' + encodeURIComponent(a.name) + '/' + (trackIdx + 1));
       _musicCurrentIdx = _musicAllTracks.findIndex(x => x.src === t.src);
       _musicDoPlay({ ...t, cover: a.cover, albumName: a.name });
       document.querySelectorAll('[id^="mta-"]').forEach(el => el.classList.remove('playing'));
@@ -2763,8 +3065,9 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
       if (el) el.classList.add('playing');
     }
 
-    function musicPlayStandalone(idx) {
+    function musicPlayStandalone(idx, noHistory) {
       const t = _musicTracks[idx];
+      if (!noHistory) history.replaceState(null, '', '#music/~' + encodeURIComponent(t.title));
       _musicCurrentIdx = _musicAllTracks.findIndex(x => x.src === t.src);
       _musicDoPlay(t);
       document.querySelectorAll('[id^="mts-"]').forEach(el => el.classList.remove('playing'));
@@ -2962,6 +3265,72 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
       }
     }
 
+    // ── Album gallery ─────────────────────────────────────────────────────────
+    const _albumsData = ${JSON.stringify(goods.albums)};
+    let _albumsLoaded = false;
+    let _lbPhotos = [], _lbIdx = 0;
+
+    function initAlbums() {
+      _albumsLoaded = true;
+      const covers = document.getElementById('album-covers');
+      if (!_albumsData.length) { covers.innerHTML = '<p class="empty">No albums yet.</p>'; return; }
+      covers.innerHTML = _albumsData.map((a, i) => \`
+        <div class="album-cover-card" onclick="albumOpen(\${i})">
+          \${a.image ? \`<img class="album-cover-img" src="\${_escHtml(a.image)}" alt="" loading="lazy">\`
+                     : '<div class="album-cover-no-img">🖼️</div>'}
+          <div class="album-cover-body">
+            <div class="album-cover-title">\${_escHtml(a.title)}</div>
+            <div class="album-cover-count">\${(a.photos || []).length} photo\${(a.photos || []).length !== 1 ? 's' : ''}</div>
+          </div>
+        </div>\`).join('');
+    }
+
+    function albumOpen(i) {
+      const a = _albumsData[i];
+      document.getElementById('album-grid-view').style.display = 'none';
+      document.getElementById('album-detail-view').style.display = 'block';
+      document.getElementById('album-detail-title').textContent = a.title;
+      _lbPhotos = a.photos || [];
+      const grid = document.getElementById('album-photo-grid');
+      grid.innerHTML = _lbPhotos.map((src, pi) => \`<img class="album-photo-thumb" src="\${_escHtml(src)}" alt="" loading="lazy" onclick="lbOpen(\${pi})">\`).join('');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    function albumShowGrid() {
+      document.getElementById('album-detail-view').style.display = 'none';
+      document.getElementById('album-grid-view').style.display = 'block';
+    }
+
+    function lbOpen(idx) {
+      _lbIdx = idx;
+      document.getElementById('lightbox').classList.add('open');
+      lbShow();
+      document.addEventListener('keydown', lbKey);
+    }
+
+    function lbShow() {
+      document.getElementById('lightbox-img').src = _lbPhotos[_lbIdx];
+      document.getElementById('lightbox-counter').textContent = (_lbIdx + 1) + ' / ' + _lbPhotos.length;
+    }
+
+    function lbNav(dir) {
+      _lbIdx = (_lbIdx + dir + _lbPhotos.length) % _lbPhotos.length;
+      lbShow();
+    }
+
+    function lbClose(e) {
+      // Called directly by close button (no arg) or by overlay click (arg is event)
+      if (e && e.target !== document.getElementById('lightbox')) return;
+      document.getElementById('lightbox').classList.remove('open');
+      document.removeEventListener('keydown', lbKey);
+    }
+
+    function lbKey(e) {
+      if (e.key === 'ArrowRight') lbNav(1);
+      else if (e.key === 'ArrowLeft') lbNav(-1);
+      else if (e.key === 'Escape') { document.getElementById('lightbox').classList.remove('open'); document.removeEventListener('keydown', lbKey); }
+    }
+
     // ── Inline appointment booking ────────────────────────────────────────────
     const _apptsData = ${JSON.stringify(goods.appointments)};
     let _apptsLoaded = false;
@@ -2977,7 +3346,76 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
       const container = document.getElementById('appointments-list');
       if (!_apptsData.length) { container.innerHTML = '<p class="empty">No appointments yet.</p>'; return; }
       container.innerHTML = _apptsData.map((appt, i) => {
-        const fmtPrice = appt.price > 0 ? ('$' + (appt.price / 100).toFixed(2) + '/session') : 'Free';
+        const fmtPrice    = appt.price > 0 ? ('$' + (appt.price / 100).toFixed(2) + '/session') : 'Free';
+        const hasSchedule = !!appt.hasSchedule;
+        const hasInquiry  = Array.isArray(appt.bookingForm) && appt.bookingForm.length > 0;
+        const btnLabel    = hasSchedule && hasInquiry ? 'Book or Inquire →'
+                          : hasInquiry ? 'Request a Quote →'
+                          : 'Book a Time →';
+
+        const scheduleHtml = hasSchedule ? \`
+          <div id="appt-step-dates-\${i}">
+            <h3 style="font-size:15px;font-weight:600;margin-bottom:12px;">Choose a date</h3>
+            <div id="appt-date-strip-\${i}" class="appt-date-strip"></div>
+            <div id="appt-loading-\${i}" style="font-size:13px;color:#888;">Loading availability…</div>
+            <div id="appt-no-slots-\${i}" style="display:none;font-size:13px;color:#888;">No upcoming availability.</div>
+          </div>
+          <div id="appt-step-slots-\${i}" style="display:none">
+            <h3 id="appt-slot-heading-\${i}" style="font-size:15px;font-weight:600;margin-bottom:10px;">Available times</h3>
+            <div id="appt-slot-grid-\${i}" class="appt-slot-grid"></div>
+          </div>
+          <div id="appt-form-\${i}" style="display:none">
+            <div id="appt-slot-display-\${i}" class="appt-selected-slot"></div>
+            <div class="sub-field-group"><label>Your Name *</label><input type="text" id="appt-name-\${i}" placeholder="Full name"></div>
+            <div class="sub-field-group"><label>Email *</label><input type="email" id="appt-email-\${i}" placeholder="For booking confirmation"></div>
+            <div style="display:flex;gap:10px;margin-top:6px;flex-wrap:wrap;">
+              <button class="appt-back-btn" onclick="apptBackToSlots(\${i})">← Change time</button>
+              <button class="appt-book-btn" id="appt-proceed-btn-\${i}" onclick="apptProceed(\${i})">\${appt.price === 0 ? 'Confirm Booking →' : 'Continue to Payment →'}</button>
+            </div>
+            <div id="appt-form-error-\${i}" class="sub-error"></div>
+          </div>
+          <div id="appt-payment-\${i}" style="display:none">
+            <div id="appt-slot-display-pay-\${i}" class="appt-selected-slot" style="margin-bottom:14px;"></div>
+            <div id="appt-stripe-el-\${i}" style="margin-bottom:14px;"></div>
+            <button class="appt-book-btn" id="appt-pay-btn-\${i}" onclick="apptConfirmPayment(\${i})">Pay $\${(appt.price/100).toFixed(2)}</button>
+            <div id="appt-pay-loading-\${i}" style="display:none;font-size:13px;color:#888;margin-top:8px;"></div>
+            <div id="appt-pay-error-\${i}" class="sub-error"></div>
+          </div>
+          <div id="appt-confirm-\${i}" style="display:none">
+            <div class="appt-confirm-box">
+              <div class="icon">✅</div>
+              <h3>You're booked!</h3>
+              <div class="slot-label" id="appt-confirm-slot-\${i}"></div>
+              <p style="font-size:12px;color:#888;margin-top:8px;">A confirmation has been sent to your email.</p>
+            </div>
+          </div>\` : '';
+
+        const inquiryHtml = hasInquiry ? (() => {
+          const formFields = appt.bookingForm.map((f, fi) => {
+            const fid   = \`appt-inq-\${i}-\${fi}\`;
+            const label = _escHtml(f.label || f.id || 'Field');
+            const req   = f.required ? ' *' : '';
+            if (f.type === 'textarea') {
+              return \`<div class="appt-inquiry-field"><label for="\${fid}">\${label}\${req}</label><textarea id="\${fid}" placeholder="\${_escHtml(f.placeholder || '')}"></textarea></div>\`;
+            } else if (f.type === 'select' && Array.isArray(f.options)) {
+              const opts = f.options.map(o => \`<option value="\${_escHtml(String(o))}">\${_escHtml(String(o))}</option>\`).join('');
+              return \`<div class="appt-inquiry-field"><label for="\${fid}">\${label}\${req}</label><select id="\${fid}"><option value="">Select…</option>\${opts}</select></div>\`;
+            } else {
+              const type = ['text','number','date','email','tel'].includes(f.type) ? f.type : 'text';
+              return \`<div class="appt-inquiry-field"><label for="\${fid}">\${label}\${req}</label><input type="\${type}" id="\${fid}" placeholder="\${_escHtml(f.placeholder || '')}"></div>\`;
+            }
+          }).join('');
+          return \`
+          <div class="appt-inquiry-form" id="appt-inq-wrap-\${i}">
+            \${hasSchedule ? '<div class="appt-section-divider">Or send an inquiry</div>' : ''}
+            \${formFields}
+            <div class="appt-inquiry-field"><label for="appt-inq-name-\${i}">Your Name *</label><input type="text" id="appt-inq-name-\${i}" placeholder="Full name"></div>
+            <div class="appt-inquiry-field"><label for="appt-inq-email-\${i}">Your Email *</label><input type="email" id="appt-inq-email-\${i}" placeholder="So they can reach you"></div>
+            <div id="appt-inq-error-\${i}" class="sub-error"></div>
+            <button class="appt-book-btn" onclick="apptSendInquiry(\${i})" style="margin-top:8px;">Open in Email →</button>
+          </div>\`;
+        })() : '';
+
         return \`
         <div class="appt-card">
           <div class="appt-card-header" onclick="apptToggle(\${i})">
@@ -2986,48 +3424,15 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
               <div class="appt-name">\${_escHtml(appt.title)}</div>
               \${appt.description ? \`<div class="appt-desc">\${_escHtml(appt.description)}</div>\` : ''}
               <div class="appt-meta">
-                <span class="appt-chip">💰 \${fmtPrice}</span>
-                <span class="appt-chip">⏱ \${appt.duration || 60} min</span>
+                \${appt.price > 0 ? \`<span class="appt-chip">💰 \${fmtPrice}</span>\` : ''}
+                \${hasSchedule ? \`<span class="appt-chip">⏱ \${appt.duration || 60} min</span>\` : ''}
               </div>
-              <button class="appt-book-btn">Book →</button>
+              <button class="appt-book-btn">\${btnLabel}</button>
             </div>
           </div>
           <div class="appt-booking-panel" id="appt-panel-\${i}">
-            <div id="appt-step-dates-\${i}">
-              <h3 style="font-size:15px;font-weight:600;margin-bottom:12px;">Choose a date</h3>
-              <div id="appt-date-strip-\${i}" class="appt-date-strip"></div>
-              <div id="appt-loading-\${i}" style="font-size:13px;color:#888;">Loading availability…</div>
-              <div id="appt-no-slots-\${i}" style="display:none;font-size:13px;color:#888;">No upcoming availability.</div>
-            </div>
-            <div id="appt-step-slots-\${i}" style="display:none">
-              <h3 id="appt-slot-heading-\${i}" style="font-size:15px;font-weight:600;margin-bottom:10px;">Available times</h3>
-              <div id="appt-slot-grid-\${i}" class="appt-slot-grid"></div>
-            </div>
-            <div id="appt-form-\${i}" style="display:none">
-              <div id="appt-slot-display-\${i}" class="appt-selected-slot"></div>
-              <div class="sub-field-group"><label>Your Name *</label><input type="text" id="appt-name-\${i}" placeholder="Full name"></div>
-              <div class="sub-field-group"><label>Email *</label><input type="email" id="appt-email-\${i}" placeholder="For booking confirmation"></div>
-              <div style="display:flex;gap:10px;margin-top:6px;flex-wrap:wrap;">
-                <button class="appt-back-btn" onclick="apptBackToSlots(\${i})">← Change time</button>
-                <button class="appt-book-btn" id="appt-proceed-btn-\${i}" onclick="apptProceed(\${i})">\${appt.price === 0 ? 'Confirm Booking →' : 'Continue to Payment →'}</button>
-              </div>
-              <div id="appt-form-error-\${i}" class="sub-error"></div>
-            </div>
-            <div id="appt-payment-\${i}" style="display:none">
-              <div id="appt-slot-display-pay-\${i}" class="appt-selected-slot" style="margin-bottom:14px;"></div>
-              <div id="appt-stripe-el-\${i}" style="margin-bottom:14px;"></div>
-              <button class="appt-book-btn" id="appt-pay-btn-\${i}" onclick="apptConfirmPayment(\${i})">Pay $\${(appt.price/100).toFixed(2)}</button>
-              <div id="appt-pay-loading-\${i}" style="display:none;font-size:13px;color:#888;margin-top:8px;"></div>
-              <div id="appt-pay-error-\${i}" class="sub-error"></div>
-            </div>
-            <div id="appt-confirm-\${i}" style="display:none">
-              <div class="appt-confirm-box">
-                <div class="icon">✅</div>
-                <h3>You're booked!</h3>
-                <div class="slot-label" id="appt-confirm-slot-\${i}"></div>
-                <p style="font-size:12px;color:#888;margin-top:8px;">A confirmation has been sent to your email.</p>
-              </div>
-            </div>
+            \${scheduleHtml}
+            \${inquiryHtml}
           </div>
         </div>\`;
       }).join('');
@@ -3040,7 +3445,7 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
       if (!isOpen) {
         panel.classList.add('open');
         panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        if (!_apptState[i]) { _apptState[i] = {}; apptLoadSlots(i); }
+        if (!_apptState[i]) { _apptState[i] = {}; if (_apptsData[i].hasSchedule) apptLoadSlots(i); }
       }
     }
 
@@ -3215,6 +3620,40 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
       conf.style.display = 'block';
       document.getElementById(\`appt-confirm-slot-\${i}\`).textContent = apptFormatSlot(i, slotStr);
       conf.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    function apptSendInquiry(i) {
+      const appt    = _apptsData[i];
+      const nameEl  = document.getElementById(\`appt-inq-name-\${i}\`);
+      const emailEl = document.getElementById(\`appt-inq-email-\${i}\`);
+      const errEl   = document.getElementById(\`appt-inq-error-\${i}\`);
+      errEl.style.display = 'none';
+
+      const name  = nameEl?.value.trim() || '';
+      const email = emailEl?.value.trim() || '';
+      if (!name)  { errEl.textContent = 'Name is required.';  errEl.style.display = 'block'; return; }
+      if (!email) { errEl.textContent = 'Email is required.'; errEl.style.display = 'block'; return; }
+
+      // Collect and validate custom form fields
+      const lines = [];
+      for (const [fi, f] of (appt.bookingForm || []).entries()) {
+        const el = document.getElementById(\`appt-inq-\${i}-\${fi}\`);
+        const val = el ? el.value.trim() : '';
+        if (f.required && !val) {
+          errEl.textContent = (f.label || f.id || 'A required field') + ' is required.';
+          errEl.style.display = 'block';
+          return;
+        }
+        if (val) lines.push((f.label || f.id) + ': ' + val);
+      }
+      lines.push('Name: ' + name, 'Email: ' + email);
+
+      const to      = appt.contactEmail || '';
+      const subject = 'Booking inquiry: ' + appt.title;
+      const body    = lines.join('\\n');
+      window.location.href = 'mailto:' + encodeURIComponent(to)
+        + '?subject=' + encodeURIComponent(subject)
+        + '&body='    + encodeURIComponent(body);
     }
 
     async function startVideoUpload(input, agoraId, title) {
@@ -3607,15 +4046,14 @@ async function startServer(params) {
       if (!tenant) return res.status(404).send('<h1>Agora not found</h1>');
 
       const title = decodeURIComponent(req.params.title);
-      const sanoraUrlInternal = getSanoraUrl();
       const wikiOrigin = `${reqProto(req)}://${req.get('host')}`;
-      const sanoraUrl = `${wikiOrigin}/plugin/allyabase/sanora`;
-      const productsResp = await fetch(`${sanoraUrlInternal}/products/${tenant.uuid}`);
+      const sanoraUrl = getSanoraPublicUrl(req);
+      const productsResp = await fetch(`${getSanoraUrl()}/products/${tenant.uuid}`);
       const products = await productsResp.json();
       const product = products[title] || Object.values(products).find(p => p.title === title);
       if (!product) return res.status(404).send('<h1>Product not found</h1>');
 
-      const imageUrl = product.image ? `${sanoraUrl}/images/${product.image}` : '';
+      const imageUrl = product.image ? `${getSanoraPublicUrl(req)}/images/${product.image}` : '';
       const ebookUrl = `${wikiOrigin}/plugin/agora/${tenant.uuid}/download/${encodeURIComponent(title)}`;
       const agoraUrl = `${wikiOrigin}/plugin/agora/${tenant.uuid}`;
       const payees = tenant.addieKeys
@@ -3714,6 +4152,7 @@ async function startServer(params) {
       res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
     }
   });
+
 
   // Available slots JSON for an appointment
   app.get('/plugin/agora/:identifier/book/:title/slots', async (req, res) => {
@@ -4608,7 +5047,7 @@ async function startServer(params) {
       const sanoraPublicUrl = getSanoraPublicUrl(req);
       const imageUrl = product.image ? `${sanoraPublicUrl}/images/${product.image}` : '';
 
-      // Map artifact UUIDs to download paths by extension
+      // Map artifact UUIDs to download paths by extension (books/other)
       let epubPath = '', pdfPath = '', mobiPath = '';
       (product.artifacts || []).forEach(artifact => {
         if (artifact.includes('epub')) epubPath = `${sanoraPublicUrl}/artifacts/${artifact}`;
@@ -4755,6 +5194,23 @@ async function startServer(params) {
     }
   });
 
+  // Bio image (public)
+  app.get('/plugin/agora/:identifier/bio/image', (req, res) => {
+    const tenant = getTenantByIdentifier(req.params.identifier);
+    if (!tenant || !tenant.bio?.imageExt) return res.status(404).end();
+    const imgPath = path.join(BIOS_DIR, `${tenant.uuid}${tenant.bio.imageExt}`);
+    if (!fs.existsSync(imgPath)) return res.status(404).end();
+    const mimeMap = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp' };
+    try {
+      const buf = fs.readFileSync(imgPath);
+      res.set('Content-Type', mimeMap[tenant.bio.imageExt] || 'application/octet-stream');
+      res.set('Cache-Control', 'public, max-age=86400');
+      res.send(buf);
+    } catch (e) {
+      res.status(500).end();
+    }
+  });
+
   // Goods JSON (public)
   app.get('/plugin/agora/:identifier/goods', async (req, res) => {
     try {
@@ -4785,24 +5241,34 @@ async function startServer(params) {
         if (product.category !== 'music') continue;
         const cover = product.image ? `${sanoraPublicUrl}/images/${product.image}` : null;
         const artifacts = product.artifacts || [];
-        if (artifacts.length > 1) {
+        const jsonArtifact  = artifacts.find(a => a.endsWith('.json'));
+        const audioArtifacts = artifacts.filter(a => !a.endsWith('.json'));
+        if (audioArtifacts.length > 1) {
+          // Fetch tracklist names if available
+          let trackNames = [];
+          if (jsonArtifact) {
+            try {
+              const tlResp = await fetch(`${sanoraUrl}/artifacts/${jsonArtifact}`);
+              if (tlResp.ok) { const tl = await tlResp.json(); trackNames = tl.tracks || []; }
+            } catch { /* fall through to numbered defaults */ }
+          }
           albums.push({
             name: product.title || key,
             cover,
             description: product.description || '',
-            tracks: artifacts.map((a, i) => ({
+            tracks: audioArtifacts.map((a, i) => ({
               number: i + 1,
-              title: `Track ${i + 1}`,
+              title: trackNames[i] || `Track ${i + 1}`,
               src: `${sanoraPublicUrl}/artifacts/${a}`,
               type: 'audio/mpeg'
             }))
           });
-        } else if (artifacts.length === 1) {
+        } else if (audioArtifacts.length === 1) {
           tracks.push({
             title: product.title || key,
-            src: `${sanoraPublicUrl}/artifacts/${artifacts[0]}`,
+            src: `${sanoraPublicUrl}/artifacts/${audioArtifacts[0]}`,
             cover,
-            description: product.description || ''
+            description: product.description || '',
           });
         }
       }
@@ -4838,9 +5304,14 @@ async function startServer(params) {
       const channelDesc  = xe(tenant.description || `Music from ${tenant.name || 'this agora'}`);
       const channelLink  = `${reqProto(req)}://${req.get('host')}/plugin/agora/${tenant.uuid}`;
 
+      const mirloAlbumNamesRss = new Set(
+        (tenant.mirloFeed?.children || []).map(c => normalizeTitle(c.name))
+      );
+
       const items = [];
       for (const [key, product] of Object.entries(products)) {
         if (product.category !== 'music') continue;
+        if (mirloAlbumNamesRss.has(normalizeTitle(product.title || key))) continue;
         const cover     = product.image ? `${sanoraPublicUrl}/images/${product.image}` : null;
         const artifacts = product.artifacts || [];
         const albumName = xe(product.title || key);
@@ -4885,6 +5356,31 @@ async function startServer(params) {
             `    <itunes:author>${channelTitle}</itunes:author>`,
             `  </item>`
           ].filter(Boolean).join('\n'));
+        }
+      }
+
+      // Merge in Mirlo feed albums as RSS items
+      if (tenant.mirloFeed && Array.isArray(tenant.mirloFeed.children)) {
+        for (const album of tenant.mirloFeed.children) {
+          const albumCover = album.images?.[0]?.src || null;
+          const albumTracks = album.type === 'album' ? (album.children || []) : [album];
+          albumTracks.forEach((track, i) => {
+            const trackCover = track.images?.cover?.src || albumCover;
+            const url = track.url || '';
+            const isHls = url.endsWith('.m3u8');
+            const mime = isHls ? 'application/x-mpegURL' : 'audio/mpeg';
+            items.push([
+              `  <item>`,
+              `    <title>${xe(track.name || `Track ${i + 1}`)}</title>`,
+              `    <description>${xe(album.description || '')}</description>`,
+              `    <enclosure url="${xe(url)}" type="${mime}" length="0"/>`,
+              trackCover ? `    <itunes:image href="${xe(trackCover)}"/>` : '',
+              `    <itunes:author>${xe(album.artist || tenant.name || '')}</itunes:author>`,
+              album.type === 'album' ? `    <itunes:album>${xe(album.name)}</itunes:album>` : '',
+              `    <itunes:order>${i + 1}</itunes:order>`,
+              `  </item>`
+            ].filter(Boolean).join('\n'));
+          });
         }
       }
 
@@ -4943,9 +5439,14 @@ async function startServer(params) {
       const sanoraPublicUrl = getSanoraPublicUrl(req);
       const pageUrl = `${reqProto(req)}://${req.get('host')}/plugin/agora/${tenant.uuid}`;
 
+      const mirloAlbumNamesJson = new Set(
+        (tenant.mirloFeed?.children || []).map(c => normalizeTitle(c.name))
+      );
+
       const children = [];
       for (const [key, product] of Object.entries(products)) {
         if (product.category !== 'music') continue;
+        if (mirloAlbumNamesJson.has(normalizeTitle(product.title || key))) continue;
         const cover     = product.image ? `${sanoraPublicUrl}/images/${product.image}` : null;
         const artifacts = product.artifacts || [];
         const name      = product.title || key;
@@ -4975,6 +5476,11 @@ async function startServer(params) {
             images: cover ? { cover: { src: cover } } : {}
           });
         }
+      }
+
+      // Merge in Mirlo feed albums if present
+      if (tenant.mirloFeed && Array.isArray(tenant.mirloFeed.children)) {
+        children.push(...tenant.mirloFeed.children);
       }
 
       const feed = {

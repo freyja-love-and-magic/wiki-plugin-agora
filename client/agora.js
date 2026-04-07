@@ -56,6 +56,23 @@
             .sw-stripe-banner.done { background: #d1fae5; border-color: #10b981; }
             .sw-stripe-banner.done h4 { color: #065f46; }
             .sw-stripe-banner.done p { color: #047857; }
+            .sw-how-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 24px; }
+            .sw-how-text { font-size: 14px; color: #555; line-height: 1.5; }
+            .sw-btn-outline { background: none; border: 1px solid #0066cc; color: #0066cc; border-radius: 18px; padding: 7px 16px; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+            .sw-btn-outline:hover { background: #e8f0fe; }
+            .sw-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 9999; align-items: flex-start; justify-content: center; padding: 32px 16px; overflow-y: auto; }
+            .sw-overlay.open { display: flex; }
+            .sw-overlay-box { background: white; border-radius: 16px; max-width: 640px; width: 100%; padding: 28px 28px 24px; position: relative; box-shadow: 0 20px 60px rgba(0,0,0,0.25); }
+            .sw-overlay-close { position: absolute; top: 16px; right: 18px; font-size: 22px; line-height: 1; cursor: pointer; color: #999; background: none; border: none; }
+            .sw-overlay-close:hover { color: #333; }
+            .sw-overlay-box h2 { font-size: 20px; font-weight: 700; margin: 0 0 18px; }
+            .sw-overlay-box .sw-card { background: #f5f5f7; border-radius: 12px; padding: 18px 20px; }
+            .sw-overlay-box .sw-step { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 12px; }
+            .sw-overlay-box .sw-step:last-child { margin-bottom: 0; }
+            .sw-overlay-box .sw-step-num { background: #0066cc; color: white; border-radius: 50%; width: 24px; height: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; margin-top: 1px; }
+            .sw-overlay-box .sw-step-body { font-size: 14px; line-height: 1.5; color: #333; }
+            .sw-overlay-box .sw-step-body strong { color: #1d1d1f; }
+            .sw-overlay-box .sw-step-body code { background: #e8e8ed; border-radius: 4px; padding: 1px 5px; font-size: 12px; }
           </style>
 
           <!-- Directory -->
@@ -67,88 +84,9 @@
           </div>
 
           <!-- How to join -->
-          <div class="sw-section">
-            <h3>How to open an agora</h3>
-            <div class="sw-card">
-              <div class="sw-step">
-                <div class="sw-step-num">1</div>
-                <div class="sw-step-body"><strong>Ask the wiki owner to register you.</strong> They'll download a <strong>starter bundle</strong> — a zip with your signing key, a template folder structure, and the <code>agora-sign.js</code> utility. Run <code>node agora-sign.js init</code> to store your key securely.</div>
-              </div>
-              <div class="sw-step">
-                <div class="sw-step-num">2</div>
-                <div class="sw-step-body"><strong>Set up payouts</strong> by running <code>node agora-sign.js payouts</code>. This opens Stripe Connect onboarding so you can receive payments. Do this once before your first sale.</div>
-              </div>
-              <div class="sw-step">
-                <div class="sw-step-num">3</div>
-                <div class="sw-step-body"><strong>Build your agora folder</strong> with this structure:
-                  <div class="sw-tree">my-agora.zip
-  manifest.json       ← { "uuid": "…", "emojicode": "…", "name": "My Agora" }
-  books/
-    My Novel/         ← subfolder per book
-      my-novel.epub
-      cover.jpg
-      info.json       ← { "title": "…", "description": "…", "price": 0 }
-  music/
-    My Album/         ← subfolder = album (add cover.jpg inside)
-      cover.jpg
-      01-track.mp3
-    standalone.mp3    ← file directly here = single track
-  posts/
-    01-Hello World/   ← number prefix sets table of contents order
-      post.md         ← the post content
-      cover.jpg       ← optional cover image
-      screenshot.png  ← any assets referenced in the markdown
-      info.json       ← optional: { "title": "…", "description": "…" }
-    02-My Series/     ← subdirectories = multi-part series
-      cover.jpg       ← optional series cover
-      info.json       ← optional: { "title": "…", "description": "…" }
-      01-Part One/
-        post.md
-        diagram.png
-      02-Part Two/
-        post.md
-  albums/
-    Vacation 2025/    ← subfolder of images = photo album
-      photo1.jpg
-  products/
-    T-Shirt/          ← subfolder = physical product
-      cover.jpg
-      info.json       ← { "title": "…", "description": "…", "price": 25, "shipping": 5 }
-  appointments/
-    Office Hours/     ← subfolder = bookable appointment type
-      cover.jpg
-      info.json       ← { "title": "…", "description": "…", "price": 0, "duration": 30,
-                           "timezone": "America/Chicago", "advanceDays": 21,
-                           "availability": [
-                             { "day": "Monday", "slots": ["09:00", "10:00", "11:00"] },
-                             { "day": "Friday", "slots": ["14:00", "15:00"] }
-                           ] }
-  subscriptions/
-    Bronze Tier/      ← subfolder = infuse tier
-      cover.jpg
-      info.json       ← { "title": "…", "description": "…", "price": 500,
-                           "renewalDays": 30,
-                           "benefits": ["Early access", "Monthly exclusive track"] }
-      bonus.mp3       ← any extra files become exclusive content for infusers</div>
-                </div>
-              </div>
-              <div class="sw-step">
-                <div class="sw-step-num">4</div>
-                <div class="sw-step-body"><strong>Run <code>node agora-sign.js</code></strong> from inside your agora folder. This signs your manifest and creates an <code>upload.zip</code> next to the folder.</div>
-              </div>
-              <div class="sw-step">
-                <div class="sw-step-num">5</div>
-                <div class="sw-step-body"><strong>Drag <code>upload.zip</code> onto the upload zone below.</strong> Your goods will be registered and your agora will go live immediately.</div>
-              </div>
-              <div class="sw-step">
-                <div class="sw-step-num">6</div>
-                <div class="sw-step-body"><strong>To update your agora</strong>, add content to your folder and run <code>node agora-sign.js</code> again — existing items are overwritten, new ones added.</div>
-              </div>
-              <div class="sw-step">
-                <div class="sw-step-num">7</div>
-                <div class="sw-step-body"><strong>To view your orders</strong>, run <code>node agora-sign.js orders https://yourwiki.com</code>. This generates a signed link (valid for 5 minutes) and opens your order dashboard in the browser.</div>
-              </div>
-            </div>
+          <div class="sw-how-row">
+            <span class="sw-how-text">Build a folder with your goods, sign it, and drag the zip here to publish.</span>
+            <button class="sw-btn-outline" id="sw-how-btn">How it works →</button>
           </div>
 
           <!-- Upload -->
@@ -188,6 +126,78 @@
 
           <button class="sw-remove" id="sw-remove-btn">Remove plugin from page</button>
 
+        </div>
+
+        <!-- How it works overlay -->
+        <div class="sw-overlay" id="sw-how-overlay">
+          <div class="sw-overlay-box">
+            <button class="sw-overlay-close" id="sw-how-close">✕</button>
+            <h2>How to open an agora</h2>
+            <div class="sw-card">
+              <div class="sw-step">
+                <div class="sw-step-num">1</div>
+                <div class="sw-step-body"><strong>Ask the wiki owner to register you.</strong> They'll download a <strong>starter bundle</strong> — a zip with your signing key, a template folder, and <code>agora-sign.js</code>. Run <code>node agora-sign.js init</code> to store your key securely.</div>
+              </div>
+              <div class="sw-step">
+                <div class="sw-step-num">2</div>
+                <div class="sw-step-body"><strong>Set up payouts</strong> by running <code>node agora-sign.js payouts</code>. Opens Stripe Connect onboarding so you can receive payments. Do this once before your first sale.</div>
+              </div>
+              <div class="sw-step">
+                <div class="sw-step-num">3</div>
+                <div class="sw-step-body"><strong>Build your agora folder</strong> with this structure:
+                  <div class="sw-tree">my-agora/
+  manifest.json         ← uuid, emojicode, name, email (optional)
+  bio/
+    photo.jpg           ← optional portrait (≤ 1024×1024)
+  books/
+    My Novel/           ← epub/pdf + cover.jpg + info.json
+  music/
+    My Album/           ← cover.jpg + numbered .mp3 files
+    standalone.mp3      ← single track
+  posts/
+    01-Hello World/     ← post.md + optional cover.jpg
+    02-A Series/        ← subdirs = multi-part series
+      01-Part One/
+        post.md
+  albums/
+    Vacation 2025/      ← photo album (jpg/png)
+  products/
+    01-T-Shirt/         ← hero.jpg + info.json (add "shipping" for physical)
+  appointments/
+    Office Hours/       ← info.json with availability[] for scheduling
+    Face Painting/      ← info.json with bookingForm[] for quote requests
+  subscriptions/
+    Bronze Tier/        ← info.json + any bonus files for members</div>
+                </div>
+              </div>
+              <div class="sw-step">
+                <div class="sw-step-num">4</div>
+                <div class="sw-step-body"><strong>Optional — redirect a section to an external URL.</strong> Add a <code>redirects</code> field to <code>manifest.json</code> to send visitors to an outside page instead of the built-in section view:
+                  <div class="sw-tree">"redirects": {
+  "music": "https://mirlo.space/your-name",
+  "books": "https://your-shop.com"
+}</div>
+                  Any category key works: <code>books</code>, <code>music</code>, <code>posts</code>, <code>albums</code>, <code>products</code>, <code>appointments</code>, <code>subscriptions</code>, <code>videos</code>.
+                </div>
+              </div>
+              <div class="sw-step">
+                <div class="sw-step-num">5</div>
+                <div class="sw-step-body"><strong>Run <code>node agora-sign.js</code></strong> inside your agora folder. Signs the manifest and creates an <code>upload.zip</code> next to the folder.</div>
+              </div>
+              <div class="sw-step">
+                <div class="sw-step-num">6</div>
+                <div class="sw-step-body"><strong>Drag <code>upload.zip</code> onto the upload zone.</strong> Your goods are registered and your agora goes live immediately.</div>
+              </div>
+              <div class="sw-step">
+                <div class="sw-step-num">7</div>
+                <div class="sw-step-body"><strong>To update</strong>, add content and run <code>node agora-sign.js</code> again — existing items are overwritten, new ones added.</div>
+              </div>
+              <div class="sw-step">
+                <div class="sw-step-num">8</div>
+                <div class="sw-step-body"><strong>To view orders</strong>, run <code>node agora-sign.js orders https://yourwiki.com</code>. Generates a signed link (valid 5 min) and opens your order dashboard.</div>
+              </div>
+            </div>
+          </div>
         </div>
       `;
 
@@ -331,6 +341,21 @@
     const nameInput = container.querySelector('#sw-name-input');
     const urlBtn    = container.querySelector('#sw-url-btn');
     const urlInput  = container.querySelector('#sw-url-input');
+
+    const howBtn     = container.querySelector('#sw-how-btn');
+    const howOverlay = container.querySelector('#sw-how-overlay');
+    const howClose   = container.querySelector('#sw-how-close');
+    if (howBtn) howBtn.addEventListener('click', () => {
+      // Teleport to body to escape any stacking context in the wiki layout
+      document.body.appendChild(howOverlay);
+      howOverlay.classList.add('open');
+    });
+    function closeHowOverlay() {
+      howOverlay.classList.remove('open');
+      container.appendChild(howOverlay);
+    }
+    if (howClose)   howClose.addEventListener('click', closeHowOverlay);
+    if (howOverlay) howOverlay.addEventListener('click', e => { if (e.target === howOverlay) closeHowOverlay(); });
 
     if (urlBtn) {
       urlBtn.addEventListener('click', () => saveUrl(container));
