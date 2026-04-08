@@ -103,7 +103,9 @@ function init() {
     if (fs.existsSync(kp)) {
       console.log('✅  Already initialized. Your key is at:');
       console.log('   ', kp);
-      console.log('\nWhenever you want to upload, run:  node agora-sign.js');
+      console.log('\nIf you haven\'t connected Stripe yet, do that first:');
+      console.log('  node agora-sign.js payouts <wiki-url>');
+      console.log('\nTo sign and upload:  node agora-sign.js');
     } else {
       console.error('❌  agora-key.json not found and no stored key exists.');
       console.error('   Download a fresh starter bundle from your wiki.');
@@ -135,8 +137,10 @@ function init() {
   console.log('   ', kp);
   console.log('   agora-key.json has been removed from this folder.\n');
   console.log('Next steps:');
-  console.log('  npm install           (one-time, installs sessionless-node)');
-  console.log('  node agora-sign.js   (sign and zip whenever you want to upload)');
+  console.log('  1.  npm install                            (one-time, installs sessionless-node)');
+  console.log('  2.  node agora-sign.js payouts <wiki-url>  (connect Stripe so you can receive payments)');
+  console.log('      ⚠️  You must complete Stripe onboarding before your first upload.');
+  console.log('  3.  node agora-sign.js                     (sign and zip whenever you want to upload)');
 }
 
 // ── sign — sign manifest and create upload zip ───────────────────────────────

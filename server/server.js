@@ -305,6 +305,35 @@ async function ensureServerAddieUser() {
   return serverAddie;
 }
 
+// ── Server Sanora user (keypair for signing Sanora requests) ─────────────────
+
+// Create or load the server's own Sanora keypair.
+// Stored in ~/.agora/config.json under "keys".
+// Gives the wiki owner the same credential structure as a tenant (keys + addieKeys + stripeAccountId).
+async function ensureServerSanoraUser() {
+  const config = loadConfig();
+  if (config.keys && config.keys.pubKey) return config.keys;
+
+  const keys = await sessionless.generateKeys(() => {}, () => null);
+  const timestamp = Date.now().toString();
+  const message = timestamp + keys.pubKey;
+  const signature = signMessage(message, keys.privateKey);
+
+  const resp = await fetch(`${getSanoraUrl()}/user/create`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ timestamp, pubKey: keys.pubKey, signature })
+  });
+
+  const sanoraUser = await resp.json();
+  if (sanoraUser.error) throw new Error(`Sanora: ${sanoraUser.error}`);
+
+  config.keys = { pubKey: keys.pubKey, privateKey: keys.privateKey };
+  config.serverSanoraUuid = sanoraUser.uuid;
+  saveConfig(config);
+  return config.keys;
+}
+
 // Check whether a pubKey has a completed purchase for a productId by looking
 // for an order whose orderKey === sha256(pubKey + productId) in Sanora.
 async function hasPurchasedByPubKey(tenant, pubKey, productId) {
@@ -920,6 +949,32 @@ async function fetchMirloFeed(mirloUrl) {
   return { artistName, children };
 }
 
+// Fetch OG/meta tags from an external URL. Returns { ogTitle, ogDescription, ogImage }.
+async function fetchOgData(url) {
+  try {
+    const resp = await fetch(url, { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; agora-bot/1.0)' } });
+    if (!resp.ok) return {};
+    const html = await resp.text();
+    const getMeta = prop => {
+      const m = html.match(new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"'<>]+)["']`, 'i'))
+               || html.match(new RegExp(`<meta[^>]+content=["']([^"'<>]+)["'][^>]+property=["']${prop}["']`, 'i'));
+      return m ? m[1].trim() : null;
+    };
+    const getNameMeta = name => {
+      const m = html.match(new RegExp(`<meta[^>]+name=["']${name}["'][^>]+content=["']([^"'<>]+)["']`, 'i'))
+               || html.match(new RegExp(`<meta[^>]+content=["']([^"'<>]+)["'][^>]+name=["']${name}["']`, 'i'));
+      return m ? m[1].trim() : null;
+    };
+    return {
+      ogTitle:       getMeta('og:title')       || html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1]?.trim() || null,
+      ogDescription: getMeta('og:description') || getNameMeta('description') || null,
+      ogImage:       getMeta('og:image')       || null,
+    };
+  } catch {
+    return {};
+  }
+}
+
 // fetch() wrapper that retries on 429 with exponential backoff (1s, 2s, 4s).
 async function fetchWithRetry(url, options, maxRetries = 3) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -1246,13 +1301,32 @@ async function processArchive(zipPath, onProgress = () => {}) {
     // Verify owner signature (required for tenants registered after signing support was added).
     validateOwnerSignature(manifest, tenant);
 
+    // Require Addie and Stripe Connect to be fully set up before accepting uploads.
+    if (!tenant.addieKeys || !tenant.addieKeys.pubKey) {
+      throw new Error('Addie payment account not configured. Run `node agora-sign.js payouts` to set up payouts before uploading.');
+    }
+    // stripeConnected is set at /payouts/return (web flow); stripeAccountId is set via Polites terminal.
+    // Either one means Stripe Connect onboarding is complete.
+    if (!tenant.stripeConnected && !tenant.stripeAccountId) {
+      throw new Error('Stripe Connect onboarding not complete. Run `node agora-sign.js payouts` and finish the Stripe setup before uploading.');
+    }
+
     // Store manifest-level keywords and per-category redirect URLs in the tenant record.
     const tenantUpdates = {};
     if (Array.isArray(manifest.keywords) && manifest.keywords.length > 0) {
       tenantUpdates.keywords = manifest.keywords.join(', ');
     }
     if (manifest.redirects && typeof manifest.redirects === 'object') {
-      tenantUpdates.redirects = manifest.redirects;
+      // Enrich each redirect URL with OG metadata fetched at upload time
+      const enriched = {};
+      for (const [key, val] of Object.entries(manifest.redirects)) {
+        const url = typeof val === 'string' ? val : val?.url;
+        if (!url) continue;
+        onProgress({ type: 'progress', current: 0, total: 1, label: `🔗 Fetching link preview for ${key}…` });
+        const og = await fetchOgData(url);
+        enriched[key] = { url, ...og };
+      }
+      tenantUpdates.redirects = enriched;
     }
     if (manifest.lightMode !== undefined) {
       tenantUpdates.lightMode = !!manifest.lightMode;
@@ -1904,7 +1978,9 @@ async function getAgoraGoods(tenant, imageBaseUrl) {
                 ? lucillePlayerUrl
                 : `${getSanoraUrl()}/products/${tenant.uuid}/${encodeURIComponent(title)}`;
 
-    const resolvedUrl = (bucketName && redirects[bucketName]) || defaultUrl;
+    const redirectEntry = bucketName && redirects[bucketName];
+    const redirectUrl = redirectEntry && (typeof redirectEntry === 'string' ? redirectEntry : redirectEntry.url);
+    const resolvedUrl = redirectUrl || defaultUrl;
 
     const item = {
       title: product.title || title,
@@ -2329,6 +2405,22 @@ function renderCards(items, category) {
   }).join('');
 }
 
+function renderRedirectCard(redirect) {
+  const url  = typeof redirect === 'string' ? redirect : redirect.url;
+  const title = (typeof redirect === 'object' && redirect.ogTitle) || (() => { try { return new URL(url).hostname; } catch { return url; } })();
+  const desc  = (typeof redirect === 'object' && redirect.ogDescription) || '';
+  const img   = typeof redirect === 'object' ? redirect.ogImage : null;
+  const host  = (() => { try { return new URL(url).hostname; } catch { return ''; } })();
+  return `<div class="card redirect-card" onclick="window.open('${escHtml(url)}','_blank')" style="cursor:pointer">
+    ${img ? `<div class="card-img"><img src="${escHtml(img)}" alt="" loading="lazy"></div>` : '<div class="card-img-placeholder">🔗</div>'}
+    <div class="card-body">
+      <div class="card-title">${escHtml(title)}</div>
+      ${desc ? `<div class="card-desc">${escHtml(desc.length > 120 ? desc.slice(0, 117) + '…' : desc)}</div>` : ''}
+      <div class="redirect-card-host">↗ ${escHtml(host)}</div>
+    </div>
+  </div>`;
+}
+
 function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
   const SECTION_META = {
     books:         { label: '📚 Books',        noun: 'book' },
@@ -2396,10 +2488,6 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
     `<div class="tab active" data-id="home" onclick="show('home',this)">🏠 Home</div>`,
     ...orderedSections.map(id => {
       const meta = SECTION_META[id];
-      const redir = redirects[id];
-      if (redir) {
-        return `<a class="tab tab-external" href="${escHtml(redir)}" target="_blank" rel="noopener" data-id="${id}">${meta.label} <span class="badge">${goodsMap[id].length}</span> <span class="tab-ext-icon">↗</span></a>`;
-      }
       return `<div class="tab" data-id="${id}" onclick="show('${id}',this)">${meta.label} <span class="badge">${goodsMap[id].length}</span></div>`;
     })
   ].join('');
@@ -2533,8 +2621,7 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
     .tab { padding: 14px 18px; cursor: pointer; font-size: 14px; font-weight: 500; white-space: nowrap; border-bottom: 2px solid transparent; color: var(--text-2); transition: color 0.15s, border-color 0.15s; }
     .tab:hover { color: var(--accent); }
     .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-    a.tab-external { text-decoration: none; }
-    .tab-ext-icon { font-size: 11px; opacity: 0.7; margin-left: 2px; }
+    .redirect-card-host { margin-top: 6px; font-size: 11px; color: var(--accent); font-weight: 600; }
     .badge { background: var(--badge-bg); color: var(--accent); border-radius: 10px; padding: 1px 7px; font-size: 11px; margin-left: 5px; }
     main { max-width: 1200px; margin: 0 auto; padding: 36px 24px; }
     #music { padding-bottom: 80px; }
@@ -2752,7 +2839,7 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
   <nav>${tabs}</nav>
   <main>
     <div id="home" class="section active">${bioBanner}<div class="home-grid">${homeCards}</div></div>
-    <div id="books" class="section"><div class="grid">${renderCards(goods.books, 'book')}</div></div>
+    <div id="books" class="section"><div class="grid">${redirects.books ? renderRedirectCard(redirects.books) : ''}${renderCards(goods.books, 'book')}</div></div>
     <div id="music" class="section">
       ${tenant.mirloFeed?.url ? `<div class="mirlo-banner"><span class="mirlo-banner-text">Support this music on Mirlo</span><a href="${escHtml(tenant.mirloFeed.url)}" target="_blank" rel="noopener" class="mirlo-banner-btn">Visit Mirlo →</a></div>` : ''}
       <div id="music-album-grid"></div>
@@ -2785,8 +2872,8 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
       <button class="lightbox-next" onclick="lbNav(1);event.stopPropagation()">›</button>
       <div class="lightbox-counter" id="lightbox-counter"></div>
     </div>
-    <div id="products" class="section"><div class="grid">${renderCards(goods.products, 'product')}</div></div>
-    <div id="videos" class="section"><div class="grid">${renderCards(goods.videos, 'video')}</div></div>
+    <div id="products" class="section"><div class="grid">${redirects.products ? renderRedirectCard(redirects.products) : ''}${renderCards(goods.products, 'product')}</div></div>
+    <div id="videos" class="section"><div class="grid">${redirects.videos ? renderRedirectCard(redirects.videos) : ''}${renderCards(goods.videos, 'video')}</div></div>
     <div id="appointments" class="section">
       <div id="appointments-list"></div>
     </div>
@@ -2892,10 +2979,11 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
     function postsRenderGrid() {
       const grid = document.getElementById('posts-grid');
       const { series, standalones } = _postsRaw;
-      if (series.length === 0 && standalones.length === 0) {
+      if (series.length === 0 && standalones.length === 0 && !_postsRedirectHtml) {
         grid.innerHTML = '<p class="empty">No posts yet.</p>';
         return;
       }
+      const redirectCardHtml = _postsRedirectHtml ? \`<div class="posts-grid" style="margin-bottom:8px">\${_postsRedirectHtml}</div>\` : '';
       const seriesHtml = series.length ? \`<div class="posts-grid">\${series.map((s, i) => \`
         <div class="card" style="cursor:pointer" onclick="postsShowSeries(\${i})">
           \${s.image ? \`<div class="card-img"><img src="\${_escHtml(s.image)}" alt="" loading="lazy"></div>\` : '<div class="card-img-placeholder">📝</div>'}
@@ -2915,7 +3003,7 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
               \${p.description ? \`<div class="card-desc">\${_escHtml(p.description)}</div>\` : ''}
             </div>
           </div>\`).join('')}</div>\` : '';
-      grid.innerHTML = seriesHtml + standaloneHtml;
+      grid.innerHTML = redirectCardHtml + seriesHtml + standaloneHtml;
     }
 
     function postsShowSeries(idx) {
@@ -2949,6 +3037,11 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
     // ── Music player ────────────────────────────────────────────────────────
     let _musicLoaded = false, _musicAlbums = [], _musicTracks = [], _musicAllTracks = [], _musicCurrentIdx = -1;
     const _musicAudio = new Audio();
+    const _musicRedirectHtml  = ${redirects.music         ? JSON.stringify(renderRedirectCard(redirects.music))         : 'null'};
+    const _postsRedirectHtml  = ${redirects.posts         ? JSON.stringify(renderRedirectCard(redirects.posts))         : 'null'};
+    const _albumsRedirectHtml = ${redirects.albums        ? JSON.stringify(renderRedirectCard(redirects.albums))        : 'null'};
+    const _apptsRedirectHtml  = ${redirects.appointments  ? JSON.stringify(renderRedirectCard(redirects.appointments))  : 'null'};
+    const _subsRedirectHtml   = ${redirects.subscriptions ? JSON.stringify(renderRedirectCard(redirects.subscriptions)) : 'null'};
 
     function _escHtml(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -3000,10 +3093,11 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
 
     function musicRenderGrid() {
       const grid = document.getElementById('music-album-grid');
-      if (_musicAlbums.length === 0 && _musicTracks.length === 0) {
+      if (_musicAlbums.length === 0 && _musicTracks.length === 0 && !_musicRedirectHtml) {
         grid.innerHTML = '<p class="empty">No music yet.</p>';
         return;
       }
+      const redirectCardHtml = _musicRedirectHtml ? \`<div class="music-grid" style="margin-bottom:16px">\${_musicRedirectHtml}</div>\` : '';
       const albumsHtml = _musicAlbums.length ? \`<div class="music-grid">\${_musicAlbums.map((a, i) => \`
         <div class="card music-album-card">
           <div onclick="musicShowAlbum(\${i})" style="cursor:pointer">
@@ -3024,7 +3118,7 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
             </div>
             <div class="music-play-icon" onclick="musicPlayStandalone(\${i})">&#9654;</div>
           </div>\`).join('')}\` : '';
-      grid.innerHTML = albumsHtml + tracksHtml;
+      grid.innerHTML = redirectCardHtml + albumsHtml + tracksHtml;
     }
 
     function musicShowAlbum(idx, noHistory) {
@@ -3144,7 +3238,10 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
 
     function renderSubTiers() {
       const container = document.getElementById('subscriptions-list');
-      if (!_subsData.length) { container.innerHTML = '<p class="empty">No subscription tiers yet.</p>'; return; }
+      if (!_subsData.length && !_subsRedirectHtml) { container.innerHTML = '<p class="empty">No subscription tiers yet.</p>'; return; }
+      if (_subsRedirectHtml && !document.getElementById('subs-redirect-card')) {
+        container.insertAdjacentHTML('beforebegin', \`<div id="subs-redirect-card" class="grid" style="margin-bottom:16px">\${_subsRedirectHtml}</div>\`);
+      }
       container.innerHTML = _subsData.map((tier, i) => {
         const fmtPrice = (tier.price / 100).toFixed(2);
         const benefitsHtml = (tier.benefits && tier.benefits.length)
@@ -3273,7 +3370,10 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
     function initAlbums() {
       _albumsLoaded = true;
       const covers = document.getElementById('album-covers');
-      if (!_albumsData.length) { covers.innerHTML = '<p class="empty">No albums yet.</p>'; return; }
+      if (!_albumsData.length && !_albumsRedirectHtml) { covers.innerHTML = '<p class="empty">No albums yet.</p>'; return; }
+      if (_albumsRedirectHtml && !document.getElementById('albums-redirect-card')) {
+        covers.insertAdjacentHTML('beforebegin', \`<div id="albums-redirect-card" class="grid" style="margin-bottom:16px">\${_albumsRedirectHtml}</div>\`);
+      }
       covers.innerHTML = _albumsData.map((a, i) => \`
         <div class="album-cover-card" onclick="albumOpen(\${i})">
           \${a.image ? \`<img class="album-cover-img" src="\${_escHtml(a.image)}" alt="" loading="lazy">\`
@@ -3344,7 +3444,10 @@ function generateAgoraHTML(tenant, goods, uploadAuth = null, pageUrl = '') {
 
     function renderAppts() {
       const container = document.getElementById('appointments-list');
-      if (!_apptsData.length) { container.innerHTML = '<p class="empty">No appointments yet.</p>'; return; }
+      if (!_apptsData.length && !_apptsRedirectHtml) { container.innerHTML = '<p class="empty">No appointments yet.</p>'; return; }
+      if (_apptsRedirectHtml && !document.getElementById('appts-redirect-card')) {
+        container.insertAdjacentHTML('beforebegin', \`<div id="appts-redirect-card" class="grid" style="margin-bottom:16px">\${_apptsRedirectHtml}</div>\`);
+      }
       container.innerHTML = _apptsData.map((appt, i) => {
         const fmtPrice    = appt.price > 0 ? ('$' + (appt.price / 100).toFixed(2) + '/session') : 'Free';
         const hasSchedule = !!appt.hasSchedule;
@@ -3794,6 +3897,16 @@ async function startServer(params) {
   // Register a new tenant (owner only)
   app.post('/plugin/agora/register', owner, async (req, res) => {
     try {
+      const config = loadConfig();
+      if (!config.keys || !config.keys.pubKey) {
+        return res.status(403).json({ error: 'Server Sanora account not configured. Save your Allyabase URL first to set it up.' });
+      }
+      if (!config.serverAddie || !config.serverAddie.uuid) {
+        return res.status(403).json({ error: 'Server Addie account not configured. Save your Allyabase URL first to set it up.' });
+      }
+      if (!config.stripeOnboarded) {
+        return res.status(403).json({ error: 'Server Stripe Connect onboarding is not complete. Finish that setup before inviting tenants.' });
+      }
       const { uuid, emojicode, name, ownerPrivateKey, ownerPubKey } = await registerTenant(req.body.name);
 
       // Generate a single-use, short-lived token for the starter bundle download.
@@ -3962,7 +4075,9 @@ async function startServer(params) {
       sanoraUrl: config.sanoraUrl || '',
       lucilleUrl: config.lucilleUrl || '',
       stripeOnboarded: !!config.stripeOnboarded,
-      serverAddieReady: !!(config.serverAddie && config.serverAddie.uuid)
+      stripeAccountId: config.stripeAccountId || null,
+      serverAddieReady: !!(config.serverAddie && config.serverAddie.uuid),
+      serverKeysReady: !!(config.keys && config.keys.pubKey)
     });
   });
 
@@ -3977,17 +4092,29 @@ async function startServer(params) {
     saveConfig(config);
     console.log('[agora] Sanora URL set to:', sanoraUrl);
 
-    // Ensure the server has an Addie user (non-blocking; errors are warnings only)
+    // Ensure the server has Sanora + Addie users (non-blocking; errors are warnings only)
     let serverAddieReady = !!(config.serverAddie && config.serverAddie.uuid);
+    let serverKeysReady  = !!(config.keys && config.keys.pubKey);
     try {
       await ensureServerAddieUser();
       serverAddieReady = true;
     } catch (err) {
       console.warn('[agora] Could not create server Addie user:', err.message);
     }
+    try {
+      await ensureServerSanoraUser();
+      serverKeysReady = true;
+    } catch (err) {
+      console.warn('[agora] Could not create server Sanora user:', err.message);
+    }
 
     const updatedConfig = loadConfig();
-    res.json({ success: true, stripeOnboarded: !!updatedConfig.stripeOnboarded, serverAddieReady });
+    res.json({
+      success: true,
+      stripeOnboarded: !!updatedConfig.stripeOnboarded,
+      serverAddieReady,
+      serverKeysReady
+    });
   });
 
   // Stripe Connect Express onboarding for the server itself (owner only)
@@ -4032,11 +4159,29 @@ async function startServer(params) {
     res.send(`<!doctype html><html><head><title>Stripe Setup Complete</title>
       <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:560px;margin:80px auto;text-align:center;color:#1d1d1f;}
       h1{font-size:28px;margin-bottom:12px;} p{font-size:15px;color:#555;line-height:1.6;}
+      code{display:block;background:#f4f4f4;padding:10px 16px;border-radius:8px;font-size:13px;margin:16px auto;text-align:left;max-width:440px;}
       a{display:inline-block;margin-top:24px;padding:12px 28px;background:#0066cc;color:white;border-radius:20px;text-decoration:none;font-weight:600;}
       a:hover{background:#0055aa;}</style></head>
       <body><h1>✅ Server payouts enabled</h1>
       <p>Your agora server is now connected to Stripe. You'll receive a platform fee from all purchases across your tenants' agoras.</p>
+      <p style="margin-top:20px;font-size:14px;color:#888;">To complete setup, post your Stripe account ID to the server:<br>
+      (Addie returns this as <strong>stripeAccountId</strong> in the Express onboarding response.)</p>
+      <code>POST /plugin/agora/setup/stripe/account<br>{ "stripeAccountId": "acct_..." }</code>
       <a href="javascript:window.close()">Close this tab</a></body></html>`);
+  });
+
+  // Store the server's Stripe Connect account ID (owner only).
+  // Mirrors the tenant /terminal/stripe-account route — gives the wiki owner the full 4-tuple:
+  //   config.keys (Sanora), config.serverAddie (Addie), config.stripeAccountId (Stripe)
+  app.post('/plugin/agora/setup/stripe/account', owner, (req, res) => {
+    const { stripeAccountId } = req.body;
+    if (!stripeAccountId) return res.status(400).json({ error: 'stripeAccountId required' });
+    const config = loadConfig();
+    config.stripeAccountId = stripeAccountId;
+    config.stripeOnboarded = true;
+    saveConfig(config);
+    console.log('[agora] Server stripeAccountId saved:', stripeAccountId);
+    res.json({ ok: true });
   });
 
   // Purchase pages — agora-hosted versions of the Sanora payment templates
@@ -4354,6 +4499,14 @@ async function startServer(params) {
   // Stripe Connect Express return page — no auth, Stripe redirects here after onboarding
   app.get('/plugin/agora/:uuid/payouts/return', (req, res) => {
     const tenant = getTenantByIdentifier(req.params.uuid);
+    // Mark Stripe as connected so the upload gate knows payouts are ready.
+    if (tenant) {
+      const tenants = loadTenants();
+      if (tenants[tenant.uuid]) {
+        tenants[tenant.uuid].stripeConnected = true;
+        saveTenants(tenants);
+      }
+    }
     const name     = tenant ? escHtml(tenant.name) : 'your agora';
     const agoraUrl = tenant ? `/plugin/agora/${tenant.uuid}` : '/';
     res.set('Content-Type', 'text/html');

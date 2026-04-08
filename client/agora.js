@@ -117,9 +117,14 @@
             </div>
 
             <h3 style="margin-top:20px">Register a new agora (owner only)</h3>
-            <div class="sw-register">
-              <input type="text" id="sw-name-input" placeholder="Agora name (e.g. Zach's Art Store)">
-              <button class="sw-btn sw-btn-green" id="sw-register-btn">Register</button>
+            <div id="sw-register-locked" class="sw-status info" style="display:none">
+              Save your Allyabase URL and complete Stripe onboarding above before inviting tenants.
+            </div>
+            <div id="sw-register-form">
+              <div class="sw-register">
+                <input type="text" id="sw-name-input" placeholder="Agora name (e.g. Zach's Art Store)">
+                <button class="sw-btn sw-btn-green" id="sw-register-btn">Register</button>
+              </div>
             </div>
             <div id="sw-register-status" class="sw-status"></div>
           </div>
@@ -285,11 +290,15 @@
   }
 
   function updateStripeBanner(container, result) {
-    const banner = container.querySelector('#sw-stripe-banner');
+    const banner   = container.querySelector('#sw-stripe-banner');
+    const locked   = container.querySelector('#sw-register-locked');
+    const regForm  = container.querySelector('#sw-register-form');
     if (!banner) return;
-    if (!result.serverAddieReady) {
-      // Addie not reachable yet — don't show banner until URL is saved
+    if (!result.serverAddieReady || !result.serverKeysReady) {
+      // Sanora or Addie not reachable yet — don't show banner until URL is saved
       banner.style.display = 'none';
+      if (locked)  locked.style.display  = 'block';
+      if (regForm) regForm.style.display  = 'none';
       return;
     }
     banner.style.display = 'block';
@@ -301,6 +310,8 @@
       const btn = banner.querySelector('#sw-stripe-banner-btn');
       btn.textContent = 'Update Stripe account';
       btn.style.background = '#10b981';
+      if (locked)  locked.style.display  = 'none';
+      if (regForm) regForm.style.display  = '';
     } else {
       banner.className = 'sw-stripe-banner';
       banner.querySelector('#sw-stripe-banner-title').textContent = '💳 Enable server payouts';
@@ -309,6 +320,8 @@
       const btn = banner.querySelector('#sw-stripe-banner-btn');
       btn.textContent = 'Set up payouts →';
       btn.style.background = '';
+      if (locked)  locked.style.display  = 'block';
+      if (regForm) regForm.style.display  = 'none';
     }
   }
 
